@@ -5,8 +5,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <immintrin.h>
+#include <string.h>
+#include "simd.h"
 #include "aesctr.h"
+
+#if defined(__x86_64__) && !defined(LAZER_PORTABLE)
 
 static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *rkeys, int rounds)
 {
@@ -74,6 +77,76 @@ static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *
   _mm512_storeu_si512((__m512i*)(out+384),f6);
   _mm512_storeu_si512((__m512i*)(out+448),f7);
 }
+
+#else
+
+/*
+ * Non-x86 (no VAES/AES hardware): same output as above, computed with the
+ * constant-time bitsliced AES from ../aes-ct64.h, 4 counter blocks at a time.
+ * Blocks are (nonce || 64-bit little-endian counter), the counter advances
+ * by 32 per call.
+ */
+#include "../aes-ct64.h"
+
+static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *rkeys, int rounds)
+{
+  uint64_t sk[15*8], q[8], ctr, c;
+  uint32_t w[16];
+  uint8_t buf[16];
+  int r, g, i;
+
+  /* bitsliced round keys */
+  for(r=0;r<=rounds;r++) {
+    memcpy(buf,&rkeys[r],16);
+    for(i=0;i<4;i++)
+      w[i] = _aes_dec32le(buf + 4*i);
+    _aes_ct64_interleave_in(&q[0],&q[4],w);
+    q[1] = q[2] = q[3] = q[0];
+    q[5] = q[6] = q[7] = q[4];
+    _aes_ct64_ortho(q);
+    memcpy(&sk[8*r],q,sizeof(q));
+  }
+
+  memcpy(buf,n,16);
+  ctr = 0;
+  for(i=0;i<8;i++)
+    ctr |= (uint64_t)buf[8+i] << 8*i;
+
+  for(g=0;g<8;g++) {
+    for(i=0;i<4;i++) {
+      c = ctr + 4*g + i;
+      w[4*i+0] = _aes_dec32le(buf + 0);
+      w[4*i+1] = _aes_dec32le(buf + 4);
+      w[4*i+2] = (uint32_t)c;
+      w[4*i+3] = (uint32_t)(c >> 32);
+    }
+    for(i=0;i<4;i++)
+      _aes_ct64_interleave_in(&q[i],&q[i+4],w+4*i);
+    _aes_ct64_ortho(q);
+    _aes_ct64_add_round_key(q,sk);
+    for(r=1;r<rounds;r++) {
+      _aes_ct64_bitslice_sbox(q);
+      _aes_ct64_shift_rows(q);
+      _aes_ct64_mix_columns(q);
+      _aes_ct64_add_round_key(q,sk + 8*r);
+    }
+    _aes_ct64_bitslice_sbox(q);
+    _aes_ct64_shift_rows(q);
+    _aes_ct64_add_round_key(q,sk + 8*rounds);
+    _aes_ct64_ortho(q);
+    for(i=0;i<4;i++)
+      _aes_ct64_interleave_out(w+4*i,q[i],q[i+4]);
+    for(i=0;i<16;i++)
+      _aes_enc32le(out + 64*g + 4*i, w[i]);
+  }
+
+  ctr += 32;
+  for(i=0;i<8;i++)
+    buf[8+i] = (uint8_t)(ctr >> 8*i);
+  memcpy(n,buf,16);
+}
+
+#endif
 
 void aes128ctr_init(aes128ctr_ctx *state, const uint8_t key[16], uint64_t nonce)
 {

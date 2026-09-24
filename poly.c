@@ -1,7 +1,7 @@
 #include <stdint.h>
 #include <stdalign.h>
 #include <stdio.h>
-#include <x86intrin.h>
+#include "simd.h"
 #include <math.h>
 #include <complex.h>
 #include "aesctr.h"

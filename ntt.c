@@ -2,7 +2,7 @@
 //compare to zero / add or sub p
 
 #include <stdint.h>
-#include <immintrin.h>
+#include "simd.h"
 #include "data.h"
 #include "poly.h"
 

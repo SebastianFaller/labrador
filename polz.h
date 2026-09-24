@@ -2,7 +2,7 @@
 #define POLZ_H
 
 #include <stdint.h>
-#include <immintrin.h>
+#include "simd.h"
 #include "data.h"
 #include "polx.h"
 #include "poly.h"

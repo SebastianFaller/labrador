@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <immintrin.h>
+#include "simd.h"
 
 #define AES128CTR_NAMESPACE(s) aes128ctr_avx2_##s
 #define AES256CTR_NAMESPACE(s) aes256ctr_avx2_##s

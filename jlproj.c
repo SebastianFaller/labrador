@@ -1,5 +1,5 @@
 #include <stdint.h>
-#include <immintrin.h>
+#include "simd.h"
 #include <stdlib.h>
 #include <string.h>
 #include "data.h"

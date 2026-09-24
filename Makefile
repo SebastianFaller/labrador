@@ -7,6 +7,17 @@ ifdef TIMING
 CFLAGS += -DTIMING -DTIMING_DEPTH=$(TIMING)
 endif
 
+# non-x86 targets (e.g. aarch64) emulate AVX-512 with SIMDe (see simd.h);
+# PORTABLE=1 forces this on x86-64 for testing.
+# The SIMDe headers are unpacked by the top-level Makefile (make lib-all).
+SIMDE_DIR ?= ../../third_party/simde-d4d85e3
+ifneq ($(shell uname -m),x86_64)
+CFLAGS += -I$(SIMDE_DIR) -DSIMDE_ENABLE_NATIVE_ALIASES -Werror=implicit-function-declaration
+else ifeq ($(PORTABLE),1)
+CFLAGS += -I$(SIMDE_DIR) -DSIMDE_ENABLE_NATIVE_ALIASES -DLAZER_PORTABLE -DSIMDE_NO_NATIVE \
+  -Werror=implicit-function-declaration
+endif
+
 RM = /bin/rm
 
 SOURCES = aesctr.c comkey.c constraints.c cpucycles.c dachshund.c data.c \

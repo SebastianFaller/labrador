@@ -2,7 +2,7 @@
 #define POLY_H
 
 #include <stdint.h>
-#include <immintrin.h>
+#include "simd.h"
 #include <complex.h>
 #include "data.h"
 
