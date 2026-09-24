@@ -1,3 +1,4 @@
+#include <stdalign.h>
 #include <stdint.h>
 #include "simd.h"
 #include <stdlib.h>
