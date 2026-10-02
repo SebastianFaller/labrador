@@ -18,6 +18,11 @@ CFLAGS += -I$(SIMDE_DIR) -DSIMDE_ENABLE_NATIVE_ALIASES -DLAZER_PORTABLE -DSIMDE_
   -Werror=implicit-function-declaration
 endif
 
+# LAB_PRG=CHACHA20: ChaCha20 instead of AES-CTR behind the aesctr.h API
+ifdef LAB_PRG
+CFLAGS += -DLAB_PRG_$(patsubst LAB_PRG_%,%,$(LAB_PRG))
+endif
+
 RM = /bin/rm
 
 SOURCES = aesctr.c comkey.c constraints.c cpucycles.c dachshund.c data.c \

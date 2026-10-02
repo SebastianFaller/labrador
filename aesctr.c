@@ -10,6 +10,64 @@
 #include "aesctr.h"
 #include "parallel.h"
 
+#ifdef LAB_PRG_CHACHA20
+
+/* ChaCha20 instead of AES-CTR, see aesctr.h for the construction */
+#include "../chacha20.h"
+
+static const uint8_t lab_chacha20_k16_pad[16] = {
+  'L','A','B','-','C','H','A','C','H','A','2','0','-','K','1','6'
+};
+
+void aes128ctr_init(aes128ctr_ctx *state, const uint8_t key[16], uint64_t nonce)
+{
+  uint8_t k[32];
+
+  memcpy(k, key, 16);
+  memcpy(k + 16, lab_chacha20_k16_pad, 16);
+  chacha20_init(state->s, k, nonce);
+  explicit_bzero(k, sizeof(k));
+}
+
+void aes256ctr_init(aes256ctr_ctx *state, const uint8_t key[32], uint64_t nonce)
+{
+  chacha20_init(state->s, key, nonce);
+}
+
+void aes128ctr_select(aes128ctr_ctx *state, uint64_t nonce) {
+  chacha20_setnonce(state->s, nonce);
+}
+
+void aes256ctr_select(aes256ctr_ctx *state, uint64_t nonce) {
+  chacha20_setnonce(state->s, nonce);
+}
+
+void aes128ctr_squeezeblocks(uint8_t *out, size_t nblocks, aes128ctr_ctx *state)
+{
+  chacha20_blocks(state->s, out, nblocks * (AES128CTR_BLOCKBYTES / CHACHA20_BLOCKBYTES));
+}
+
+void aes256ctr_squeezeblocks(uint8_t *out, size_t nblocks, aes256ctr_ctx *state)
+{
+  chacha20_blocks(state->s, out, nblocks * (AES256CTR_BLOCKBYTES / CHACHA20_BLOCKBYTES));
+}
+
+/* "asynchronous" squeeze API used by the multi-threaded build: with ChaCha20
+ * the keystream is generated immediately (synchronously); the stream and the
+ * order in which it is consumed are the same as with plain squeezeblocks. */
+void aes128ctr_squeezeblocks_start(aes128ctr_async *h, uint8_t *out, size_t nblocks, aes128ctr_ctx *state)
+{
+  h->async = 0;
+  aes128ctr_squeezeblocks(out, nblocks, state);
+}
+
+void aes128ctr_squeezeblocks_finish(aes128ctr_async *h)
+{
+  (void)h;
+}
+
+#else /* AES-CTR */
+
 #if defined(__x86_64__) && !defined(LAZER_PORTABLE)
 
 static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *rkeys, int rounds)
@@ -427,3 +485,5 @@ void aes256ctr_squeezeblocks(uint8_t *out, size_t nblocks, aes256ctr_ctx *state)
     out += AES256CTR_BLOCKBYTES;
   }
 }
+
+#endif /* LAB_PRG_CHACHA20 */
