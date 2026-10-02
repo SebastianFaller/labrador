@@ -81,21 +81,79 @@ static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *
 #else
 
 /*
- * Non-x86 (no VAES/AES hardware): same output as above, computed with the
- * constant-time bitsliced AES from ../aes-ct64.h, 4 counter blocks at a time.
- * Blocks are (nonce || 64-bit little-endian counter), the counter advances
- * by 32 per call.
+ * Non-x86 (no VAES/AES hardware): same output as above, computed with
+ * constant-time bitsliced AES. Blocks are (nonce || 64-bit little-endian
+ * counter), the counter advances by 32 per call. The bitsliced round keys
+ * are computed once in aes*ctr_init (state->bsk), not per call.
  */
 #include "../aes-ct64.h"
 
-static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *rkeys, int rounds)
-{
-  uint64_t sk[15*8], q[8], ctr, c;
-  uint32_t w[16];
-  uint8_t buf[16];
-  int r, g, i;
+static inline uint64_t load64le(const uint8_t *buf) {
+  uint64_t x = 0;
+  int i;
+  for(i=0;i<8;i++)
+    x |= (uint64_t)buf[i] << 8*i;
+  return x;
+}
 
-  /* bitsliced round keys */
+static inline void store64le(uint8_t *buf, uint64_t x) {
+  int i;
+  for(i=0;i<8;i++)
+    buf[i] = (uint8_t)(x >> 8*i);
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(LAZER_AES_NO_NEON)
+
+/* aarch64: NEON bitsliced AES, 8 blocks in parallel (see ../aes-neonbs.h) */
+#include "../aes-neonbs.h"
+
+static void bitslice_rkeys(__m128i *bsk, const __m128i *rkeys, int rounds) {
+  uint8_t buf[15*16];
+
+  memcpy(buf,rkeys,16*(rounds+1));
+  _aes_nbs_expand_rks((uint8_t *)bsk,buf,rounds);
+}
+
+static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *bsk, int rounds)
+{
+  uint8_t buf[16], blk[128];
+  uint64_t ctr;
+  int g, i;
+
+  memcpy(buf,n,16);
+  ctr = load64le(buf+8);
+
+  if((ctr & 7) == 0) {
+    /* always the case via the API (counter starts at 0, advances by 32) */
+    for(g=0;g<4;g++) {
+      store64le(buf+8,ctr+8*g);
+      _aes_nbs_ctr8(out+128*g,buf,8,(const uint8_t *)bsk,rounds);
+    }
+  }
+  else {
+    for(i=0;i<8;i++)
+      memcpy(blk+16*i,buf,8);
+    for(g=0;g<4;g++) {
+      for(i=0;i<8;i++)
+        store64le(blk+16*i+8,ctr+8*g+i);
+      _aes_nbs_encrypt8(out+128*g,blk,(const uint8_t *)bsk,rounds);
+    }
+  }
+
+  store64le(buf+8,ctr+32);
+  memcpy(n,buf,16);
+}
+
+#else
+
+/* generic: 64-bit bitsliced AES (BearSSL aes_ct64), 4 blocks in parallel */
+
+static void bitslice_rkeys(__m128i *bsk, const __m128i *rkeys, int rounds) {
+  uint64_t q[8];
+  uint32_t w[4];
+  uint8_t buf[16];
+  int r, i;
+
   for(r=0;r<=rounds;r++) {
     memcpy(buf,&rkeys[r],16);
     for(i=0;i<4;i++)
@@ -104,13 +162,20 @@ static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *
     q[1] = q[2] = q[3] = q[0];
     q[5] = q[6] = q[7] = q[4];
     _aes_ct64_ortho(q);
-    memcpy(&sk[8*r],q,sizeof(q));
+    memcpy(&bsk[4*r],q,sizeof(q));
   }
+}
 
+static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *bsk, int rounds)
+{
+  uint64_t sk[15*8], q[8], ctr, c;
+  uint32_t w[16];
+  uint8_t buf[16];
+  int r, g, i;
+
+  memcpy(sk,bsk,8*8*(rounds+1));
   memcpy(buf,n,16);
-  ctr = 0;
-  for(i=0;i<8;i++)
-    ctr |= (uint64_t)buf[8+i] << 8*i;
+  ctr = load64le(buf+8);
 
   for(g=0;g<8;g++) {
     for(i=0;i<4;i++) {
@@ -140,12 +205,18 @@ static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *
       _aes_enc32le(out + 64*g + 4*i, w[i]);
   }
 
-  ctr += 32;
-  for(i=0;i<8;i++)
-    buf[8+i] = (uint8_t)(ctr >> 8*i);
+  store64le(buf+8,ctr+32);
   memcpy(n,buf,16);
 }
 
+#endif
+
+#endif
+
+#ifdef AESCTR_BSKEYS
+#define AESCTR_KEYS(state) ((state)->bsk)
+#else
+#define AESCTR_KEYS(state) ((state)->rkeys)
 #endif
 
 void aes128ctr_init(aes128ctr_ctx *state, const uint8_t key[16], uint64_t nonce)
@@ -189,6 +260,9 @@ void aes128ctr_init(aes128ctr_ctx *state, const uint8_t key[16], uint64_t nonce)
   _mm_store_si128(&state->rkeys[idx++],temp0);
 
 #undef BLOCK1
+#ifdef AESCTR_BSKEYS
+  bitslice_rkeys(state->bsk, state->rkeys, 10);
+#endif
 }
 
 void aes256ctr_init(aes256ctr_ctx *state, const uint8_t key[32], uint64_t nonce)
@@ -246,6 +320,10 @@ void aes256ctr_init(aes256ctr_ctx *state, const uint8_t key[32], uint64_t nonce)
   _mm_store_si128(&state->rkeys[idx++],temp0);
 
 #undef BLOCK1
+#undef BLOCK2
+#ifdef AESCTR_BSKEYS
+  bitslice_rkeys(state->bsk, state->rkeys, 14);
+#endif
 }
 
 void aes128ctr_select(aes128ctr_ctx *state, uint64_t nonce) {
@@ -260,7 +338,7 @@ void aes128ctr_squeezeblocks(uint8_t *out, size_t nblocks, aes128ctr_ctx *state)
 {
   size_t i;
   for(i=0;i<nblocks;i++) {
-    vaesni_encrypt8(out, &state->n, state->rkeys, 10);
+    vaesni_encrypt8(out, &state->n, AESCTR_KEYS(state), 10);
     out += AES128CTR_BLOCKBYTES;
   }
 }
@@ -269,7 +347,7 @@ void aes256ctr_squeezeblocks(uint8_t *out, size_t nblocks, aes256ctr_ctx *state)
 {
   size_t i;
   for(i=0;i<nblocks;i++) {
-    vaesni_encrypt8(out, &state->n, state->rkeys, 14);
+    vaesni_encrypt8(out, &state->n, AESCTR_KEYS(state), 14);
     out += AES256CTR_BLOCKBYTES;
   }
 }

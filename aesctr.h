@@ -11,14 +11,25 @@
 #define AES128CTR_BLOCKBYTES 512
 #define AES256CTR_BLOCKBYTES 512
 
+/* without AES hardware: round keys are also cached in bitsliced form */
+#if !defined(__x86_64__) || defined(LAZER_PORTABLE)
+#define AESCTR_BSKEYS 1
+#endif
+
 typedef struct {
   __m128i rkeys[11];
   __m128i n;
+#ifdef AESCTR_BSKEYS
+  __m128i bsk[11*8];
+#endif
 } aes128ctr_ctx;
 
 typedef struct {
   __m128i rkeys[15];
   __m128i n;
+#ifdef AESCTR_BSKEYS
+  __m128i bsk[15*8];
+#endif
 } aes256ctr_ctx;
 
 #define aes128ctr_init AES128CTR_NAMESPACE(init)
