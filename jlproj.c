@@ -1,6 +1,7 @@
 #include <stdalign.h>
 #include <stdint.h>
 #include "simd.h"
+#include "simd_neon.h"
 #include <stdlib.h>
 #include <string.h>
 #include "data.h"
@@ -39,6 +40,121 @@ void polyvec_jlproj_add_bin1(
  * 8 qwords -> zvec: 1 col stride
  */
 
+#ifdef LABRADOS_NEON
+/* NEON version of jlproj_add64 (out[row] += sum_col (+-1) in[col], mod 2^32).
+ *
+ * Bit (row,col) of the matrix (row in [0,256), col in [0,64)) lives in byte
+ *   512*(col/16) + 64*(row/32) + 8*(col%8) + (row%8),  bit 4*((col%16)/8) + (row%32)/8,
+ * and a set bit means -in[col]. As in the AVX-512 code, the 64 columns are grouped
+ * into 16 groups {c, c+16, c+32, c+48}; for every group a 16-entry table holds all
+ * signed sums of the 4 (secret) coefficients, indexed by a nibble of (public) matrix
+ * bits. The 16-entry int32 tables are split into byte planes so that a single TBL
+ * looks up 16 rows at once: T = p0 + 2^8*p1 + 2^16*p2 with p0,p1 the two low bytes
+ * and p2 = T>>16 in [-2,1] (|T| <= 2^17). The planes are accumulated separately
+ * (16 tables: sum p0,p1 <= 4080 fits uint16, sum p2 in [-32,16] fits int8) and
+ * recombined, which gives exactly out + sum_t T_t mod 2^32, i.e. the same result as
+ * the wrapping 32-bit additions of the AVX-512 code.
+ * Constant time: the table contents are secret, but they are only accessed through
+ * TBL register lookups and loads at fixed addresses; the lookup indices are public
+ * matrix bits. No branches depend on data. */
+static void jlproj_add64(int32_t out[256], const int16_t in[64], const uint8_t mat[256*64/8]) {
+  size_t c,j,q,rb,h;
+  uint8_t pl[16][3][16] __attribute__((aligned(16)));  // [table][plane][index]
+  const int32x4_t sgn0 = {1,-1,1,-1};
+  const int32x4_t sgn1 = {1,1,-1,-1};
+
+  /* tables: T_c[idx] = sum_j (bit j of idx ? -1 : 1)*in[16*j+c] = E[idx&3] + G[idx>>2] */
+  for(c=0;c<16;c++) {
+    const int32_t a0 = in[c], a1 = in[16+c], a2 = in[32+c], a3 = in[48+c];
+    const int32_t g[4] = {a2+a3, a3-a2, a2-a3, -a2-a3};
+    const int32x4_t e = vmlaq_n_s32(vmulq_n_s32(sgn0,a0),sgn1,a1);
+    int32x4_t t[4];
+    int16x8_t lo01, lo23, hi01, hi23;
+    for(j=0;j<4;j++)
+      t[j] = vaddq_s32(e,vdupq_n_s32(g[j]));
+    lo01 = vcombine_s16(vmovn_s32(t[0]),vmovn_s32(t[1]));
+    lo23 = vcombine_s16(vmovn_s32(t[2]),vmovn_s32(t[3]));
+    hi01 = vcombine_s16(vshrn_n_s32(t[0],16),vshrn_n_s32(t[1],16));
+    hi23 = vcombine_s16(vshrn_n_s32(t[2],16),vshrn_n_s32(t[3],16));
+    vst1q_u8(pl[c][0],vreinterpretq_u8_s8(vcombine_s8(vmovn_s16(lo01),vmovn_s16(lo23))));
+    vst1q_u8(pl[c][1],vreinterpretq_u8_s8(vcombine_s8(vshrn_n_s16(lo01,8),vshrn_n_s16(lo23,8))));
+    vst1q_u8(pl[c][2],vreinterpretq_u8_s8(vcombine_s8(vmovn_s16(hi01),vmovn_s16(hi23))));
+  }
+
+  for(rb=0;rb<8;rb++) {
+    /* idx[k][q]: byte b holds in its low nibble the index of table 2q+b/8 and in its
+     * high nibble the index of table 2q+b/8+8, for row 32*rb+8*k+b%8.
+     * Nibble bit j comes from column block j (4x4 bit transpose). */
+    uint8x16_t idx[4][4];
+    const uint8x16_t m55 = vdupq_n_u8(0x55), m33 = vdupq_n_u8(0x33);
+    for(q=0;q<4;q++) {
+      uint8x16_t s = vld1q_u8(&mat[64*rb+16*q+512*0]);
+      uint8x16_t t = vld1q_u8(&mat[64*rb+16*q+512*1]);
+      uint8x16_t u = vld1q_u8(&mat[64*rb+16*q+512*2]);
+      uint8x16_t v = vld1q_u8(&mat[64*rb+16*q+512*3]);
+      uint8x16_t ste = vbslq_u8(m55,s,vshlq_n_u8(t,1));
+      uint8x16_t sto = vbslq_u8(m55,vshrq_n_u8(s,1),t);
+      uint8x16_t uve = vbslq_u8(m55,u,vshlq_n_u8(v,1));
+      uint8x16_t uvo = vbslq_u8(m55,vshrq_n_u8(u,1),v);
+      idx[0][q] = vbslq_u8(m33,ste,vshlq_n_u8(uve,2));
+      idx[1][q] = vbslq_u8(m33,sto,vshlq_n_u8(uvo,2));
+      idx[2][q] = vbslq_u8(m33,vshrq_n_u8(ste,2),uve);
+      idx[3][q] = vbslq_u8(m33,vshrq_n_u8(sto,2),uvo);
+    }
+
+    for(h=0;h<2;h++) {  // rows 32*rb+16*h+[0,16)
+      uint16x8_t a0l = vdupq_n_u16(0), a0h = a0l, a1l = a0l, a1h = a0l;
+      int8x16_t a2 = vdupq_n_s8(0);
+      int32_t *o = &out[32*rb+16*h];
+      int32x4_t o0,o1,o2,o3;
+      int16x8_t s2l, s2h;
+
+#define LOOKUP(C,IX) do {                                         \
+        uint8x16_t b0_ = vqtbl1q_u8(vld1q_u8(pl[C][0]),IX);       \
+        uint8x16_t b1_ = vqtbl1q_u8(vld1q_u8(pl[C][1]),IX);       \
+        uint8x16_t b2_ = vqtbl1q_u8(vld1q_u8(pl[C][2]),IX);       \
+        a0l = vaddw_u8(a0l,vget_low_u8(b0_));                     \
+        a0h = vaddw_high_u8(a0h,b0_);                             \
+        a1l = vaddw_u8(a1l,vget_low_u8(b1_));                     \
+        a1h = vaddw_high_u8(a1h,b1_);                             \
+        a2 = vaddq_s8(a2,vreinterpretq_s8_u8(b2_));               \
+      } while(0)
+
+      for(q=0;q<4;q++) {
+        const uint64x2_t x0 = vreinterpretq_u64_u8(idx[2*h][q]);
+        const uint64x2_t x1 = vreinterpretq_u64_u8(idx[2*h+1][q]);
+        const uint8x16_t za = vreinterpretq_u8_u64(vzip1q_u64(x0,x1));  // tables 2q, 2q+8
+        const uint8x16_t zb = vreinterpretq_u8_u64(vzip2q_u64(x0,x1));  // tables 2q+1, 2q+9
+        const uint8x16_t m0f = vdupq_n_u8(0x0F);
+        LOOKUP(2*q,  vandq_u8(za,m0f));
+        LOOKUP(2*q+8,vshrq_n_u8(za,4));
+        LOOKUP(2*q+1,vandq_u8(zb,m0f));
+        LOOKUP(2*q+9,vshrq_n_u8(zb,4));
+      }
+#undef LOOKUP
+
+      s2l = vmovl_s8(vget_low_s8(a2));
+      s2h = vmovl_high_s8(a2);
+      o0 = vld1q_s32(&o[0]);
+      o1 = vld1q_s32(&o[4]);
+      o2 = vld1q_s32(&o[8]);
+      o3 = vld1q_s32(&o[12]);
+      o0 = vaddq_s32(o0,vreinterpretq_s32_u32(vaddw_u16(vshll_n_u16(vget_low_u16(a1l),8),vget_low_u16(a0l))));
+      o1 = vaddq_s32(o1,vreinterpretq_s32_u32(vaddw_high_u16(vshll_high_n_u16(a1l,8),a0l)));
+      o2 = vaddq_s32(o2,vreinterpretq_s32_u32(vaddw_u16(vshll_n_u16(vget_low_u16(a1h),8),vget_low_u16(a0h))));
+      o3 = vaddq_s32(o3,vreinterpretq_s32_u32(vaddw_high_u16(vshll_high_n_u16(a1h,8),a0h)));
+      o0 = vaddq_s32(o0,vshll_n_s16(vget_low_s16(s2l),16));
+      o1 = vaddq_s32(o1,vshll_high_n_s16(s2l,16));
+      o2 = vaddq_s32(o2,vshll_n_s16(vget_low_s16(s2h),16));
+      o3 = vaddq_s32(o3,vshll_high_n_s16(s2h,16));
+      vst1q_s32(&o[0],o0);
+      vst1q_s32(&o[4],o1);
+      vst1q_s32(&o[8],o2);
+      vst1q_s32(&o[12],o3);
+    }
+  }
+}
+#else
 static void jlproj_add64(int32_t out[256], const int16_t in[64], const uint8_t mat[256*64/8]) {
   int i;
   __m512i a,b,c,d;
@@ -245,6 +361,7 @@ static void jlproj_add64(int32_t out[256], const int16_t in[64], const uint8_t m
 #undef BLOCK
   }
 }
+#endif
 
 void poly_jlproj_add(int32_t out[256], const poly in, const uint8_t mat[256*N/8]) {
   size_t i;
@@ -407,6 +524,48 @@ static void jlproj_collapsmat32(int64_t *row, const uint8_t *mat, size_t len, co
   r = _mm512_permutexvar_epi64(revidx,r);  // -+++,-++-,-+-+,-+--,--++,--+-,---+,----
 #endif
 
+#if !defined(JL_FORCE_AVX512) && !(defined(__x86_64__) && !defined(LAZER_PORTABLE))
+  /* Non-x86: SIMDe emulates _mm512_permutex2var_epi64 lane by lane, which made
+   * this loop ~50% of all prover/verifier cycles. Each permutex2var is just a
+   * 16-entry table lookup indexed by a 4-bit nibble of the (public) JL matrix,
+   * so do exactly that in scalar code. Wrapping uint64 adds give results
+   * identical to _mm512_add_epi64. */
+  (void)u; (void)v;
+  {
+    alignas(64) uint64_t tab[8][16];
+    size_t j;
+    _mm512_store_si512((__m512i*)&tab[0][0],a); _mm512_store_si512((__m512i*)&tab[0][8],k);
+    _mm512_store_si512((__m512i*)&tab[1][0],b); _mm512_store_si512((__m512i*)&tab[1][8],l);
+    _mm512_store_si512((__m512i*)&tab[2][0],c); _mm512_store_si512((__m512i*)&tab[2][8],m);
+    _mm512_store_si512((__m512i*)&tab[3][0],d); _mm512_store_si512((__m512i*)&tab[3][8],n);
+    _mm512_store_si512((__m512i*)&tab[4][0],e); _mm512_store_si512((__m512i*)&tab[4][8],o);
+    _mm512_store_si512((__m512i*)&tab[5][0],f); _mm512_store_si512((__m512i*)&tab[5][8],p);
+    _mm512_store_si512((__m512i*)&tab[6][0],g); _mm512_store_si512((__m512i*)&tab[6][8],q);
+    _mm512_store_si512((__m512i*)&tab[7][0],h); _mm512_store_si512((__m512i*)&tab[7][8],r);
+
+    for(i=0;i<len/32;i++) {
+      const uint8_t *mi = &mat[256*32/8*i];
+      uint64_t *rw = (uint64_t*)&row[32*i];
+      for(j=0;j<8;j++) {
+        uint64_t sv, tv, w0, x0, y0, z0;
+        memcpy(&sv, mi + 8*j, 8);
+        memcpy(&tv, mi + 256*16/8 + 8*j, 8);
+        w0 = rw[j]; x0 = rw[8+j]; y0 = rw[16+j]; z0 = rw[24+j];
+#define NBLOCK(G)                                   \
+        w0 += tab[G][sv & 15]; y0 += tab[G][tv & 15]; \
+        sv >>= 4; tv >>= 4;                          \
+        x0 += tab[G][sv & 15]; z0 += tab[G][tv & 15]; \
+        sv >>= 4; tv >>= 4
+        NBLOCK(0); NBLOCK(1); NBLOCK(2); NBLOCK(3);
+        NBLOCK(4); NBLOCK(5); NBLOCK(6); NBLOCK(7);
+#undef NBLOCK
+        rw[j] = w0; rw[8+j] = x0; rw[16+j] = y0; rw[24+j] = z0;
+      }
+    }
+  }
+  return;
+#endif
+
 #define BLOCK(T0,T1)                      \
   u = _mm512_permutex2var_epi64(T0,s,T1); \
   v = _mm512_permutex2var_epi64(T0,t,T1); \
@@ -504,6 +663,74 @@ void jlproj_expand_challenge(int64_t alpha[256], const uint8_t buf[256*QBYTES]) 
 #endif
 }
 
+#ifdef LABRADOS_NEON
+/* NEON: decomposition of the 64-bit row sums into L=3 limbs, identical to the
+ * AVX-512 code (srai_epi64, mul_epi32 with the low 32 bits of x>>LOGQ, mask
+ * compress-stores of the low 16 bits of each lane):
+ *   f = (x & (2^LOGQ-1)) + (int64)(int32)(x>>LOGQ)*QOFF,
+ *   limb0 = f & 0x3FFF, limb1 = (f>>14) & 0x3FFF, limb2 = (int16)(f>>28).
+ * |f| < 2^38 + 2^31*2^8 < 2^40 for every int64 x, so f>>14 fits in 32 bits and the
+ * rest of the computation is done exactly in 32-bit lanes. */
+static void jl_decompose(polz *t, const int64_t *raw, size_t cnt) {
+  size_t i,j;
+  const int64x2_t mask = vdupq_n_s64(((int64_t)1 << LOGQ) - 1);
+  const int32x4_t qoff = vdupq_n_s32(QOFF);
+  const int16x8_t mask14 = vdupq_n_s16(0x3FFF);
+  _Static_assert(L == 3, "jl_decompose assumes 3 limbs");
+
+  for(i=0;i<cnt;i++) {
+    for(j=0;j<N/8;j++) {
+      const int64_t *x = &raw[N*i+8*j];
+      int64x2_t x0 = vld1q_s64(x+0), x1 = vld1q_s64(x+2), x2 = vld1q_s64(x+4), x3 = vld1q_s64(x+6);
+      int32x4_t g01 = vcombine_s32(vmovn_s64(vshrq_n_s64(x0,LOGQ)),vmovn_s64(vshrq_n_s64(x1,LOGQ)));
+      int32x4_t g23 = vcombine_s32(vmovn_s64(vshrq_n_s64(x2,LOGQ)),vmovn_s64(vshrq_n_s64(x3,LOGQ)));
+      int64x2_t f0 = vmlal_s32(vandq_s64(x0,mask),vget_low_s32(g01),vget_low_s32(qoff));
+      int64x2_t f1 = vmlal_high_s32(vandq_s64(x1,mask),g01,qoff);
+      int64x2_t f2 = vmlal_s32(vandq_s64(x2,mask),vget_low_s32(g23),vget_low_s32(qoff));
+      int64x2_t f3 = vmlal_high_s32(vandq_s64(x3,mask),g23,qoff);
+      int32x4_t l01 = vuzp1q_s32(vreinterpretq_s32_s64(f0),vreinterpretq_s32_s64(f1));
+      int32x4_t l23 = vuzp1q_s32(vreinterpretq_s32_s64(f2),vreinterpretq_s32_s64(f3));
+      int32x4_t h01 = vcombine_s32(vshrn_n_s64(f0,14),vshrn_n_s64(f1,14));
+      int32x4_t h23 = vcombine_s32(vshrn_n_s64(f2,14),vshrn_n_s64(f3,14));
+      int16x8_t limb0 = vandq_s16(vuzp1q_s16(vreinterpretq_s16_s32(l01),vreinterpretq_s16_s32(l23)),mask14);
+      int16x8_t limb1 = vandq_s16(vuzp1q_s16(vreinterpretq_s16_s32(h01),vreinterpretq_s16_s32(h23)),mask14);
+      int16x8_t limb2 = vuzp1q_s16(vreinterpretq_s16_s32(vshrq_n_s32(h01,14)),vreinterpretq_s16_s32(vshrq_n_s32(h23,14)));
+      vst1q_s16(&t[i]->limbs[0]->c[8*j],limb0);
+      vst1q_s16(&t[i]->limbs[1]->c[8*j],limb1);
+      vst1q_s16(&t[i]->limbs[2]->c[8*j],limb2);
+    }
+  }
+}
+
+void polxvec_jlproj_collapsmat(polxvec r, const uint8_t *mat, const int64_t alpha[256]) {
+  size_t i;
+  alignas(64) int64_t raw[16*N];
+  polz t[16];
+  size_t rpos = 0;
+  size_t len = r->len;
+
+  while(len >= 16) {
+    memset(raw,0,sizeof(int64_t)*16*N);
+    for(i=0;i<256/32;i++)
+      jlproj_collapsmat32(raw,&mat[32*16/8*i],16*N,&alpha[32*i]);
+    jl_decompose(t,raw,16);
+    polzvec_sigmam1(t,t,16);
+    polzvec_topolxvec(r,t,rpos,1,16);
+    rpos += 16;
+    mat += 256*16*N/8;
+    len -= 16;
+  }
+
+  if(len) {
+    memset(raw,0,sizeof(int64_t)*len*N);
+    for(i=0;i<256/32;i++)
+      jlproj_collapsmat32(raw,&mat[32*16/8*i],len*N,&alpha[32*i]);
+    jl_decompose(t,raw,len);
+    polzvec_sigmam1(t,t,len);
+    polzvec_topolxvec(r,t,rpos,1,len);
+  }
+}
+#else
 void polxvec_jlproj_collapsmat(polxvec r, const uint8_t *mat, const int64_t alpha[256]) {
   size_t i,j,k;
   __m512i f,g;
@@ -569,6 +796,7 @@ void polxvec_jlproj_collapsmat(polxvec r, const uint8_t *mat, const int64_t alph
     polzvec_topolxvec(r,t,rpos,1,len);
   }
 }
+#endif
 
 static inline int64_t _mm512_hsum_epi64(__m512i a) {
   __m256i t;

@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "simd.h"
+#include "simd_neon.h"
 #include <math.h>
 #include <stdio.h>
 #include <assert.h>
@@ -302,6 +303,46 @@ double polzvec_norm(const polz *a, size_t len) {
   return sqrtl(r);
 }
 
+#ifdef LABRADOS_NEON
+/* NEON: literal translation of the AVX-512 code (16-bit lanes, wrapping arithmetic;
+ * mulhi with the positive constant 4*QOFF via sqdmulh is exact). */
+void polz_reduce(polz r) {
+  size_t i,j;
+  const int16x8_t qoff = vdupq_n_s16(QOFF);
+  const int16x8_t qofft4 = vdupq_n_s16(4*QOFF);
+  const int16x8_t mask14 = vdupq_n_s16(0x3FFF);
+  const int16x8_t maskhi = vdupq_n_s16(0x3FFF >> (14*L-LOGQ));
+
+  for(i=0;i<N/32;i++) {
+    size_t u;
+    int16x8_t f[4],g[4],h[4];
+    for(u=0;u<4;u++) f[u] = vld1q_s16(&r->limbs[L-1]->c[32*i+8*u]);
+    for(u=0;u<4;u++) g[u] = vshrq_n_s16(f[u],LOGQ-14*(L-1));
+    for(u=0;u<4;u++) f[u] = vandq_s16(f[u],maskhi);
+    for(u=0;u<4;u++) vst1q_s16(&r->limbs[L-1]->c[32*i+8*u],f[u]);
+
+    for(u=0;u<4;u++) f[u] = vld1q_s16(&r->limbs[0]->c[32*i+8*u]);
+    for(u=0;u<4;u++) h[u] = vmulq_s16(g[u],qoff);
+    for(u=0;u<4;u++) g[u] = neon_mulhi_s16_c(g[u],qofft4);
+    for(u=0;u<4;u++) h[u] = vandq_s16(h[u],mask14);
+    for(u=0;u<4;u++) f[u] = vaddq_s16(f[u],h[u]);
+    for(u=0;u<4;u++) h[u] = vshrq_n_s16(f[u],14);
+    for(u=0;u<4;u++) f[u] = vandq_s16(f[u],mask14);
+    for(u=0;u<4;u++) g[u] = vaddq_s16(g[u],h[u]);
+    for(u=0;u<4;u++) vst1q_s16(&r->limbs[0]->c[32*i+8*u],f[u]);
+
+    for(j=1;j<L;j++) {
+      for(u=0;u<4;u++) f[u] = vld1q_s16(&r->limbs[j]->c[32*i+8*u]);
+      for(u=0;u<4;u++) f[u] = vaddq_s16(f[u],g[u]);
+      if(j<L-1) {
+        for(u=0;u<4;u++) g[u] = vshrq_n_s16(f[u],14);
+        for(u=0;u<4;u++) f[u] = vandq_s16(f[u],mask14);
+      }
+      for(u=0;u<4;u++) vst1q_s16(&r->limbs[j]->c[32*i+8*u],f[u]);
+    }
+  }
+}
+#else
 void polz_reduce(polz r) {
   size_t i,j;
   __m512i f,g,h;
@@ -337,6 +378,7 @@ void polz_reduce(polz r) {
     }
   }
 }
+#endif
 
 void polzvec_reduce(polz *r, size_t len) {
   size_t i;
@@ -378,6 +420,51 @@ void polzvec_caddq(polz *r, size_t len) {
     polz_caddq(r[i]);
 }
 
+#ifdef LABRADOS_NEON
+void polz_center(polz r) {
+  size_t i,j;
+  int16_t qq[L], hq[L];
+
+  for(i=0;i<L;i++)
+    qq[i] = modulus->q->limbs[i];
+  for(i=0;i<L-1;i++)
+    hq[i] = (int16_t)((uint16_t)(((uint16_t)qq[i] >> 1) + (uint16_t)((uint16_t)qq[i+1] << 13)) & 0x3FFF);
+  hq[L-1] = (int16_t)((uint16_t)qq[L-1] >> 1);
+
+  {
+    const int16x8_t mask14 = vdupq_n_s16(0x3FFF);
+    int16x8_t vq[L], vh[L];
+    for(j=0;j<L;j++) {
+      vq[j] = vdupq_n_s16(qq[j]);
+      vh[j] = vdupq_n_s16(hq[j]);
+    }
+    for(i=0;i<N/32;i++) {
+    size_t u;
+      int16x8_t f[4],c[4],m[4];
+      for(u=0;u<4;u++) c[u] = vdupq_n_s16(0);
+      for(u=0;u<4;u++) f[u] = c[u];
+      for(j=0;j<L;j++) {
+        for(u=0;u<4;u++) f[u] = vld1q_s16(&r->limbs[j]->c[32*i+8*u]);
+        for(u=0;u<4;u++) f[u] = vsubq_s16(vh[j],f[u]);
+        if(j > 0) for(u=0;u<4;u++) f[u] = vaddq_s16(f[u],c[u]);
+        if(j < L-1) for(u=0;u<4;u++) c[u] = vshrq_n_s16(f[u],14);
+      }
+      for(u=0;u<4;u++) m[u] = vshrq_n_s16(f[u],15);  // movepi16_mask: all ones in negative lanes
+
+      for(j=0;j<L;j++) {
+        for(u=0;u<4;u++) f[u] = vld1q_s16(&r->limbs[j]->c[32*i+8*u]);
+        for(u=0;u<4;u++) f[u] = vsubq_s16(f[u],vandq_s16(vq[j],m[u]));
+        if(j > 0) for(u=0;u<4;u++) f[u] = vaddq_s16(f[u],c[u]);
+        if(j < L-1) {
+          for(u=0;u<4;u++) c[u] = vshrq_n_s16(f[u],14);
+          for(u=0;u<4;u++) f[u] = vandq_s16(f[u],mask14);
+        }
+        for(u=0;u<4;u++) vst1q_s16(&r->limbs[j]->c[32*i+8*u],f[u]);
+      }
+    }
+  }
+}
+#else
 void polz_center(polz r) {
   size_t i,j;
   __m512i f,c;
@@ -416,6 +503,7 @@ void polz_center(polz r) {
     }
   }
 }
+#endif
 
 void polzvec_center(polz *r, size_t len) {
   size_t i;
@@ -424,6 +512,27 @@ void polzvec_center(polz *r, size_t len) {
     polz_center(r[i]);
 }
 
+#ifdef LABRADOS_NEON
+void polz_topoly_montgomery(poly r, const polz a, const pdata prime) {
+  size_t i,j,u;
+  const int16x8_t pinvt4 = vdupq_n_s16((int16_t)((uint16_t)prime->pinv << 2));
+  const int16x8_t p = vdupq_n_s16(prime->p);
+
+  for(i=0;i<N/32;i++) {
+    int16x8_t f[4],g[4],h[4];
+    for(u=0;u<4;u++) g[u] = vld1q_s16(&a->limbs[0]->c[32*i+8*u]);
+    for(j=1;j<L;j++) {
+      for(u=0;u<4;u++) h[u] = vmulq_s16(g[u],pinvt4);
+      for(u=0;u<4;u++) f[u] = vld1q_s16(&a->limbs[j]->c[32*i+8*u]);
+      for(u=0;u<4;u++) g[u] = vshrq_n_s16(g[u],14);
+      for(u=0;u<4;u++) h[u] = neon_mulhi_u16(h[u],p);
+      for(u=0;u<4;u++) g[u] = vaddq_s16(f[u],g[u]);
+      for(u=0;u<4;u++) g[u] = vsubq_s16(g[u],h[u]);
+    }
+    for(u=0;u<4;u++) vst1q_s16(&r->c[32*i+8*u],g[u]);
+  }
+}
+#else
 void polz_topoly_montgomery(poly r, const polz a, const pdata prime) {
   size_t i,j;
   __m512i f,g,h;
@@ -446,6 +555,7 @@ void polz_topoly_montgomery(poly r, const polz a, const pdata prime) {
   //Scaling factor multiplied during NTT
   //poly_scale(r,r,(1LL << (14*(L-1)+16)) % prime->p,prime);
 }
+#endif
 
 void polzvec_topolyvec_montgomery(poly *r, const polz *a, ssize_t stride, size_t len, const pdata prime) {
   size_t i;
@@ -519,6 +629,62 @@ void polzvec_topolxvec(polxvec r, const polz *a, size_t off, ssize_t stride, siz
   }
 }
 
+#ifdef LABRADOS_NEON
+static void zz_poly_mul(polz r, const zz a, const poly b) {
+  size_t i,j;
+  int16x8_t e[L];
+  const int16x8_t maskb = vdupq_n_s16((1 << (LOGQ - 14*(L-1))) - 1);
+  const int16x8_t mask = vdupq_n_s16(0x3FFF);
+  const int16x8_t qoff = vdupq_n_s16(QOFF);
+  const int16x8_t qofft4 = vdupq_n_s16(4*QOFF);
+
+  for(i=0;i<L;i++)
+    e[i] = vdupq_n_s16(a->limbs[i]);
+
+  for(i=0;i<N/32;i++) {
+    size_t u;
+    int16x8_t f[4],ff[4],g[4],h[4],k[4],l[4];
+    for(u=0;u<4;u++) f[u] = vld1q_s16(&b->c[32*i+8*u]);
+    for(u=0;u<4;u++) ff[u] = vshlq_n_s16(f[u],2);
+
+    for(u=0;u<4;u++) h[u] = vmulq_s16(f[u],e[L-1]);
+    for(u=0;u<4;u++) g[u] = neon_mulhi_u16(f[u],e[L-1]);
+    for(u=0;u<4;u++) k[u] = vreinterpretq_s16_u16(vshrq_n_u16(vreinterpretq_u16_s16(h[u]),LOGQ - 14*(L-1)));
+    for(u=0;u<4;u++) g[u] = vshlq_n_s16(g[u],16-(LOGQ - 14*(L-1)));
+    for(u=0;u<4;u++) h[u] = vandq_s16(h[u],maskb);
+    for(u=0;u<4;u++) k[u] = vaddq_s16(k[u],g[u]);
+    for(u=0;u<4;u++) vst1q_s16(&r->limbs[L-1]->c[32*i+8*u],h[u]);
+
+    for(u=0;u<4;u++) h[u] = vmulq_s16(f[u],e[0]);
+    for(u=0;u<4;u++) l[u] = vmulq_s16(qoff,k[u]);
+    for(u=0;u<4;u++) g[u] = neon_mulhi_u16(ff[u],e[0]);
+    for(u=0;u<4;u++) k[u] = neon_mulhi_u16(qofft4,k[u]);
+    for(u=0;u<4;u++) h[u] = vandq_s16(h[u],mask);
+    for(u=0;u<4;u++) l[u] = vandq_s16(l[u],mask);
+    for(u=0;u<4;u++) h[u] = vaddq_s16(h[u],l[u]);
+    for(u=0;u<4;u++) l[u] = vreinterpretq_s16_u16(vshrq_n_u16(vreinterpretq_u16_s16(h[u]),14));
+    for(u=0;u<4;u++) h[u] = vandq_s16(h[u],mask);
+    for(u=0;u<4;u++) k[u] = vaddq_s16(k[u],g[u]);
+    for(u=0;u<4;u++) k[u] = vaddq_s16(k[u],l[u]);
+    for(u=0;u<4;u++) vst1q_s16(&r->limbs[0]->c[32*i+8*u],h[u]);
+
+    for(j=1;j<L-1;j++) {
+      for(u=0;u<4;u++) h[u] = vmulq_s16(f[u],e[j]);
+      for(u=0;u<4;u++) g[u] = neon_mulhi_u16(ff[u],e[j]);
+      for(u=0;u<4;u++) h[u] = vandq_s16(h[u],mask);
+      for(u=0;u<4;u++) h[u] = vaddq_s16(h[u],k[u]);
+      for(u=0;u<4;u++) k[u] = vreinterpretq_s16_u16(vshrq_n_u16(vreinterpretq_u16_s16(h[u]),14));
+      for(u=0;u<4;u++) h[u] = vandq_s16(h[u],mask);
+      for(u=0;u<4;u++) k[u] = vaddq_s16(k[u],g[u]);
+      for(u=0;u<4;u++) vst1q_s16(&r->limbs[j]->c[32*i+8*u],h[u]);
+    }
+
+    for(u=0;u<4;u++) g[u] = vld1q_s16(&r->limbs[L-1]->c[32*i+8*u]);
+    for(u=0;u<4;u++) g[u] = vaddq_s16(g[u],k[u]);
+    for(u=0;u<4;u++) vst1q_s16(&r->limbs[L-1]->c[32*i+8*u],g[u]);
+  }
+}
+#else
 static void zz_poly_mul(polz r, const zz a, const poly b) {
   size_t i,j;
   int bits;
@@ -577,7 +743,73 @@ static void zz_poly_mul(polz r, const zz a, const poly b) {
     _mm512_store_si512(&r->limbs[L-1]->v[i],g);  // 2^bits+2^14+2^13-1
   }
 }
+#endif
 
+#ifdef LABRADOS_NEON
+static void zz_poly_fma(polz r, const zz a, const poly b) {
+  size_t i,j;
+  int16x8_t e[L];
+  const int16x8_t maskb = vdupq_n_s16((1 << (LOGQ - 14*(L-1))) - 1);
+  const int16x8_t mask = vdupq_n_s16(0x3FFF);
+  const int16x8_t qoff = vdupq_n_s16(QOFF);
+  const int16x8_t qofft4 = vdupq_n_s16(4*QOFF);
+
+  for(i=0;i<L;i++)
+    e[i] = vdupq_n_s16(a->limbs[i]);
+
+  for(i=0;i<N/32;i++) {
+    size_t u;
+    int16x8_t f[4],ff[4],g[4],h[4],k[4],l[4];
+    for(u=0;u<4;u++) f[u] = vld1q_s16(&b->c[32*i+8*u]);
+    for(u=0;u<4;u++) ff[u] = vshlq_n_s16(f[u],2);
+
+    for(u=0;u<4;u++) h[u] = vmulq_s16(f[u],e[L-1]);
+    for(u=0;u<4;u++) g[u] = neon_mulhi_u16(f[u],e[L-1]);
+    for(u=0;u<4;u++) k[u] = vreinterpretq_s16_u16(vshrq_n_u16(vreinterpretq_u16_s16(h[u]),LOGQ - 14*(L-1)));
+    for(u=0;u<4;u++) g[u] = vshlq_n_s16(g[u],16-(LOGQ - 14*(L-1)));
+    for(u=0;u<4;u++) h[u] = vandq_s16(h[u],maskb);
+    for(u=0;u<4;u++) g[u] = vaddq_s16(g[u],k[u]);
+    for(u=0;u<4;u++) k[u] = vld1q_s16(&r->limbs[L-1]->c[32*i+8*u]);
+    for(u=0;u<4;u++) h[u] = vaddq_s16(h[u],k[u]);
+    for(u=0;u<4;u++) k[u] = vreinterpretq_s16_u16(vshrq_n_u16(vreinterpretq_u16_s16(h[u]),LOGQ - 14*(L-1)));
+    for(u=0;u<4;u++) h[u] = vandq_s16(h[u],maskb);
+    for(u=0;u<4;u++) k[u] = vaddq_s16(k[u],g[u]);
+    for(u=0;u<4;u++) vst1q_s16(&r->limbs[L-1]->c[32*i+8*u],h[u]);
+
+    for(u=0;u<4;u++) h[u] = vmulq_s16(f[u],e[0]);
+    for(u=0;u<4;u++) l[u] = vmulq_s16(qoff,k[u]);
+    for(u=0;u<4;u++) g[u] = neon_mulhi_u16(ff[u],e[0]);
+    for(u=0;u<4;u++) k[u] = neon_mulhi_u16(qofft4,k[u]);
+    for(u=0;u<4;u++) h[u] = vandq_s16(h[u],mask);
+    for(u=0;u<4;u++) l[u] = vandq_s16(l[u],mask);
+    for(u=0;u<4;u++) h[u] = vaddq_s16(h[u],l[u]);
+    for(u=0;u<4;u++) l[u] = vld1q_s16(&r->limbs[0]->c[32*i+8*u]);
+    for(u=0;u<4;u++) h[u] = vaddq_s16(h[u],l[u]);
+    for(u=0;u<4;u++) l[u] = vreinterpretq_s16_u16(vshrq_n_u16(vreinterpretq_u16_s16(h[u]),14));
+    for(u=0;u<4;u++) h[u] = vandq_s16(h[u],mask);
+    for(u=0;u<4;u++) k[u] = vaddq_s16(k[u],g[u]);
+    for(u=0;u<4;u++) k[u] = vaddq_s16(k[u],l[u]);
+    for(u=0;u<4;u++) vst1q_s16(&r->limbs[0]->c[32*i+8*u],h[u]);
+
+    for(j=1;j<L-1;j++) {
+      for(u=0;u<4;u++) h[u] = vmulq_s16(f[u],e[j]);
+      for(u=0;u<4;u++) g[u] = neon_mulhi_u16(ff[u],e[j]);
+      for(u=0;u<4;u++) h[u] = vandq_s16(h[u],mask);
+      for(u=0;u<4;u++) h[u] = vaddq_s16(h[u],k[u]);
+      for(u=0;u<4;u++) k[u] = vld1q_s16(&r->limbs[j]->c[32*i+8*u]);
+      for(u=0;u<4;u++) h[u] = vaddq_s16(h[u],k[u]);
+      for(u=0;u<4;u++) k[u] = vreinterpretq_s16_u16(vshrq_n_u16(vreinterpretq_u16_s16(h[u]),14));
+      for(u=0;u<4;u++) h[u] = vandq_s16(h[u],mask);
+      for(u=0;u<4;u++) k[u] = vaddq_s16(k[u],g[u]);
+      for(u=0;u<4;u++) vst1q_s16(&r->limbs[j]->c[32*i+8*u],h[u]);
+    }
+
+    for(u=0;u<4;u++) g[u] = vld1q_s16(&r->limbs[L-1]->c[32*i+8*u]);
+    for(u=0;u<4;u++) g[u] = vaddq_s16(g[u],k[u]);
+    for(u=0;u<4;u++) vst1q_s16(&r->limbs[L-1]->c[32*i+8*u],g[u]);
+  }
+}
+#else
 static void zz_poly_fma(polz r, const zz a, const poly b) {
   size_t i,j;
   int bits;
@@ -645,6 +877,7 @@ static void zz_poly_fma(polz r, const zz a, const poly b) {
     _mm512_store_si512(&r->limbs[L-1]->v[i],g);  // 2^bits+2^15
   }
 }
+#endif
 
 /* Explicit CRT mod q:
  * a_i = a mod p_i, |a| <= (P-1)/2
