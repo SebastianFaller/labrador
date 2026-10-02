@@ -29,6 +29,278 @@ static inline __m512i divmont(const __m512i a, const __m512i p, const __m512i pi
   return r;
 }
 
+#if !defined(NTT_FORCE_AVX512) && !(defined(__x86_64__) && !defined(LAZER_PORTABLE)) \
+    && defined(__aarch64__) && defined(__ARM_NEON) && N == 256
+/*
+ * Native NEON implementation of poly_ntt, poly_invntt and poly_nttunpack
+ * (aarch64). Bit-identical to the AVX-512 code above for ALL int16 inputs:
+ *
+ * - Every coefficient goes through exactly the same sequence of int16
+ *   operations (add/sub with wrap-around, Montgomery mulmod/divmont) as in
+ *   the AVX-512 code; only the data movement differs. The butterfly
+ *   structure (pairs, twiddles, divmont placement, output order) was
+ *   extracted from the AVX-512 code by tracing coefficient indices.
+ * - mulmod: AVX computes hi(a*b) - hi(t*p) with t = lo(a*b_pinv). Since
+ *   t*p == a*b mod 2^16 this equals (a*b - t*p)/2^16 exactly. NEON computes
+ *   sqdmulh(a,b) = floor(a*b/2^15), sqdmulh(t,p) = floor(t*p/2^15); their
+ *   difference is exactly (a*b - t*p)/2^15 (even), and shsub halves it
+ *   exactly. sqdmulh saturates only for (-2^15)*(-2^15), impossible here
+ *   since |b|, p < 2^15. divmont is the same with b = 1 (see ndivmont).
+ *   Requires b_pinv == b*pinv mod 2^16 and p*pinv == 1 mod 2^16 for the
+ *   table constants (checked by the equivalence test).
+ *
+ * Forward layout (x = coefficient array in the order of the classic
+ * Cooley-Tukey NTT with butterfly distance 128>>l at level l):
+ *   pass 1 (per k<4): levels 0-2 on the 8 vectors x[8(k+4i)..], i<8
+ *   pass 2 (per 64-block g): levels 3-4, 8x8 transpose, levels 5-7, scale,
+ *   store transposed vector c to output vector 4c+br(g), br = {0,2,1,3}.
+ * Inverse is the exact mirror.
+ */
+#include <arm_neon.h>
+
+static inline int16x8_t nmulmod(int16x8_t a, int16x8_t b, int16x8_t b_pinv, int16x8_t p) {
+  int16x8_t r,t;
+
+  t = vmulq_s16(a,b_pinv);
+  r = vqdmulhq_s16(a,b);
+  t = vqdmulhq_s16(t,p);
+  return vhsubq_s16(r,t);
+}
+
+/*
+ * divmont(a) = (a - t*p)/2^16, t = a*pinv mod 2^16. With y = sqdmulh(t,p) =
+ * floor(t*p/2^15) we have floor(a/2^15) - y = 2*divmont(a) and
+ * floor(a/2^15) is 0 or -1, so (0 - y) >> 1 == divmont(a) in both cases:
+ * the srai(a,15) term of the AVX-512 code is absorbed by the floor.
+ */
+static inline int16x8_t ndivmont(int16x8_t a, int16x8_t p, int16x8_t pinv) {
+  int16x8_t t;
+
+  t = vmulq_s16(a,pinv);
+  t = vqdmulhq_s16(t,p);
+  return vhsubq_s16(vdupq_n_s16(0),t);
+}
+
+/* lane-reversed load of 8 int16 */
+static inline int16x8_t nloadrev(const int16_t *a) {
+  int16x8_t v = vrev64q_s16(vld1q_s16(a));
+  return vextq_s16(v,v,4);
+}
+
+/* x[r][c] -> x[c][r] */
+static inline void ntranspose8(int16x8_t x[8]) {
+  int16x8_t t0,t1,t2,t3,t4,t5,t6,t7;
+  int32x4_t u0,u1,u2,u3,u4,u5,u6,u7;
+
+  t0 = vtrn1q_s16(x[0],x[1]); t1 = vtrn2q_s16(x[0],x[1]);
+  t2 = vtrn1q_s16(x[2],x[3]); t3 = vtrn2q_s16(x[2],x[3]);
+  t4 = vtrn1q_s16(x[4],x[5]); t5 = vtrn2q_s16(x[4],x[5]);
+  t6 = vtrn1q_s16(x[6],x[7]); t7 = vtrn2q_s16(x[6],x[7]);
+  u0 = vtrn1q_s32(vreinterpretq_s32_s16(t0),vreinterpretq_s32_s16(t2));
+  u2 = vtrn2q_s32(vreinterpretq_s32_s16(t0),vreinterpretq_s32_s16(t2));
+  u1 = vtrn1q_s32(vreinterpretq_s32_s16(t1),vreinterpretq_s32_s16(t3));
+  u3 = vtrn2q_s32(vreinterpretq_s32_s16(t1),vreinterpretq_s32_s16(t3));
+  u4 = vtrn1q_s32(vreinterpretq_s32_s16(t4),vreinterpretq_s32_s16(t6));
+  u6 = vtrn2q_s32(vreinterpretq_s32_s16(t4),vreinterpretq_s32_s16(t6));
+  u5 = vtrn1q_s32(vreinterpretq_s32_s16(t5),vreinterpretq_s32_s16(t7));
+  u7 = vtrn2q_s32(vreinterpretq_s32_s16(t5),vreinterpretq_s32_s16(t7));
+  x[0] = vreinterpretq_s16_s64(vtrn1q_s64(vreinterpretq_s64_s32(u0),vreinterpretq_s64_s32(u4)));
+  x[4] = vreinterpretq_s16_s64(vtrn2q_s64(vreinterpretq_s64_s32(u0),vreinterpretq_s64_s32(u4)));
+  x[1] = vreinterpretq_s16_s64(vtrn1q_s64(vreinterpretq_s64_s32(u1),vreinterpretq_s64_s32(u5)));
+  x[5] = vreinterpretq_s16_s64(vtrn2q_s64(vreinterpretq_s64_s32(u1),vreinterpretq_s64_s32(u5)));
+  x[2] = vreinterpretq_s16_s64(vtrn1q_s64(vreinterpretq_s64_s32(u2),vreinterpretq_s64_s32(u6)));
+  x[6] = vreinterpretq_s16_s64(vtrn2q_s64(vreinterpretq_s64_s32(u2),vreinterpretq_s64_s32(u6)));
+  x[3] = vreinterpretq_s16_s64(vtrn1q_s64(vreinterpretq_s64_s32(u3),vreinterpretq_s64_s32(u7)));
+  x[7] = vreinterpretq_s16_s64(vtrn2q_s64(vreinterpretq_s64_s32(u3),vreinterpretq_s64_s32(u7)));
+}
+
+/* Cooley-Tukey butterfly as in the AVX-512 code (level 0: no divmont) */
+#define NCT(A,B,Z,ZP) do {                     \
+    int16x8_t t_ = nmulmod((B),(Z),(ZP),p);    \
+    (A) = ndivmont((A),p,pinv);                \
+    (B) = vsubq_s16((A),t_);                   \
+    (A) = vaddq_s16((A),t_);                   \
+  } while(0)
+#define NCT0(A,B,Z,ZP) do {                    \
+    int16x8_t t_ = nmulmod((B),(Z),(ZP),p);    \
+    (B) = vsubq_s16((A),t_);                   \
+    (A) = vaddq_s16((A),t_);                   \
+  } while(0)
+/* Gentleman-Sande butterfly as in the AVX-512 code */
+#define NGS(A,B,Z,ZP) do {                     \
+    int16x8_t t_ = vaddq_s16((A),(B));         \
+    (B) = vsubq_s16((B),(A));                  \
+    (A) = ndivmont(t_,p,pinv);                 \
+    (B) = nmulmod((B),(Z),(ZP),p);             \
+  } while(0)
+
+static const int ntt_br2[4] = {0,2,1,3};
+
+void poly_ntt(poly r, const poly a, const pdata prime) {
+  size_t i,k,g,bg;
+  int16x8_t x[8],z,zp;
+  int16_t tmp[N] __attribute__((aligned(64)));
+  const int16_t *zt = prime->zetas->c;
+  const int16_t *ztp = prime->zetas_pinv->c;
+  const int16x8_t p = vdupq_n_s16(prime->p);
+  const int16x8_t pinv = vdupq_n_s16(prime->pinv);
+
+  /* pass 1: levels 0-2 */
+  for(k=0;k<4;k++) {
+    for(i=0;i<8;i++)
+      x[i] = vld1q_s16(&a->c[8*(k+4*i)]);
+
+    z = vdupq_n_s16(prime->i);
+    zp = vdupq_n_s16(prime->i_pinv);
+    for(i=0;i<4;i++)
+      NCT0(x[i],x[i+4],z,zp);
+
+    z = vdupq_n_s16(zt[2]); zp = vdupq_n_s16(ztp[2]);
+    NCT(x[0],x[2],z,zp); NCT(x[1],x[3],z,zp);
+    z = vdupq_n_s16(zt[3]); zp = vdupq_n_s16(ztp[3]);
+    NCT(x[4],x[6],z,zp); NCT(x[5],x[7],z,zp);
+
+    for(i=0;i<4;i++) {
+      z = vdupq_n_s16(zt[4+i]); zp = vdupq_n_s16(ztp[4+i]);
+      NCT(x[2*i],x[2*i+1],z,zp);
+    }
+
+    for(i=0;i<8;i++)
+      vst1q_s16(&tmp[8*(k+4*i)],x[i]);
+  }
+
+  /* pass 2: levels 3-7 + scaling */
+  for(g=0;g<4;g++) {
+    bg = ntt_br2[g];
+    for(i=0;i<8;i++)
+      x[i] = vld1q_s16(&tmp[8*(8*g+i)]);
+
+    z = vdupq_n_s16(zt[8+2*g]); zp = vdupq_n_s16(ztp[8+2*g]);
+    NCT(x[0],x[2],z,zp); NCT(x[1],x[3],z,zp);
+    z = vdupq_n_s16(zt[9+2*g]); zp = vdupq_n_s16(ztp[9+2*g]);
+    NCT(x[4],x[6],z,zp); NCT(x[5],x[7],z,zp);
+
+    for(i=0;i<4;i++) {
+      z = vdupq_n_s16(zt[16+4*g+i]); zp = vdupq_n_s16(ztp[16+4*g+i]);
+      NCT(x[2*i],x[2*i+1],z,zp);
+    }
+
+    ntranspose8(x);
+
+    z = vld1q_s16(&zt[32+8*g]); zp = vld1q_s16(&ztp[32+8*g]);
+    for(i=0;i<4;i++)
+      NCT(x[i],x[i+4],z,zp);
+
+    z = vld1q_s16(&zt[64+8*bg]); zp = vld1q_s16(&ztp[64+8*bg]);
+    NCT(x[0],x[2],z,zp); NCT(x[1],x[3],z,zp);
+    z = vld1q_s16(&zt[96+8*bg]); zp = vld1q_s16(&ztp[96+8*bg]);
+    NCT(x[4],x[6],z,zp); NCT(x[5],x[7],z,zp);
+
+    for(i=0;i<4;i++) {
+      z = vld1q_s16(&zt[128+32*i+8*bg]); zp = vld1q_s16(&ztp[128+32*i+8*bg]);
+      NCT(x[2*i],x[2*i+1],z,zp);
+    }
+
+    z = vdupq_n_s16(prime->f); zp = vdupq_n_s16(prime->f_pinv);
+    for(i=0;i<8;i++)
+      vst1q_s16(&r->c[8*(4*i+bg)],nmulmod(x[i],z,zp,p));
+  }
+}
+
+void poly_invntt(poly r, const poly a, const pdata prime) {
+  size_t i,k,g,bg;
+  int16x8_t x[8],z,zp;
+  int16_t tmp[N] __attribute__((aligned(64)));
+  const int16_t *zt = prime->zetas->c;
+  const int16_t *ztp = prime->zetas_pinv->c;
+  const int16x8_t p = vdupq_n_s16(prime->p);
+  const int16x8_t pinv = vdupq_n_s16(prime->pinv);
+
+  /* pass 1: levels 7-3 */
+  for(g=0;g<4;g++) {
+    bg = ntt_br2[g];
+    for(i=0;i<8;i++)
+      x[i] = vld1q_s16(&a->c[8*(4*i+bg)]);
+
+    for(i=0;i<4;i++) {
+      z = nloadrev(&zt[248-32*i-8*bg]); zp = nloadrev(&ztp[248-32*i-8*bg]);
+      NGS(x[2*i],x[2*i+1],z,zp);
+    }
+
+    z = nloadrev(&zt[120-8*bg]); zp = nloadrev(&ztp[120-8*bg]);
+    NGS(x[0],x[2],z,zp); NGS(x[1],x[3],z,zp);
+    z = nloadrev(&zt[88-8*bg]); zp = nloadrev(&ztp[88-8*bg]);
+    NGS(x[4],x[6],z,zp); NGS(x[5],x[7],z,zp);
+
+    z = nloadrev(&zt[56-8*g]); zp = nloadrev(&ztp[56-8*g]);
+    for(i=0;i<4;i++)
+      NGS(x[i],x[i+4],z,zp);
+
+    ntranspose8(x);
+
+    for(i=0;i<4;i++) {
+      z = vdupq_n_s16(zt[31-4*g-i]); zp = vdupq_n_s16(ztp[31-4*g-i]);
+      NGS(x[2*i],x[2*i+1],z,zp);
+    }
+
+    z = vdupq_n_s16(zt[15-2*g]); zp = vdupq_n_s16(ztp[15-2*g]);
+    NGS(x[0],x[2],z,zp); NGS(x[1],x[3],z,zp);
+    z = vdupq_n_s16(zt[14-2*g]); zp = vdupq_n_s16(ztp[14-2*g]);
+    NGS(x[4],x[6],z,zp); NGS(x[5],x[7],z,zp);
+
+    for(i=0;i<8;i++)
+      vst1q_s16(&tmp[8*(8*g+i)],x[i]);
+  }
+
+  /* pass 2: levels 2-0 */
+  for(k=0;k<4;k++) {
+    for(i=0;i<8;i++)
+      x[i] = vld1q_s16(&tmp[8*(k+4*i)]);
+
+    for(i=0;i<4;i++) {
+      z = vdupq_n_s16(zt[7-i]); zp = vdupq_n_s16(ztp[7-i]);
+      NGS(x[2*i],x[2*i+1],z,zp);
+    }
+
+    z = vdupq_n_s16(zt[3]); zp = vdupq_n_s16(ztp[3]);
+    NGS(x[0],x[2],z,zp); NGS(x[1],x[3],z,zp);
+    z = vdupq_n_s16(zt[2]); zp = vdupq_n_s16(ztp[2]);
+    NGS(x[4],x[6],z,zp); NGS(x[5],x[7],z,zp);
+
+    z = vdupq_n_s16(zt[1]); zp = vdupq_n_s16(ztp[1]);
+    for(i=0;i<4;i++)
+      NGS(x[i],x[i+4],z,zp);
+
+    for(i=0;i<8;i++)
+      vst1q_s16(&r->c[8*(k+4*i)],x[i]);
+  }
+}
+
+void poly_nttunpack(poly r, const pdata prime) {
+  size_t i,g,bg;
+  int16x8_t x[8];
+  int16_t tmp[N] __attribute__((aligned(64)));
+  const int16x8_t p = vdupq_n_s16(prime->p);
+  const int16x8_t pinv = vdupq_n_s16(prime->pinv);
+
+  for(g=0;g<4;g++) {
+    bg = ntt_br2[g];
+    for(i=0;i<8;i++)
+      x[i] = ndivmont(vld1q_s16(&r->c[8*(4*i+bg)]),p,pinv);
+    ntranspose8(x);
+    for(i=0;i<8;i++)
+      vst1q_s16(&tmp[8*(8*g+i)],x[i]);
+  }
+  for(i=0;i<N/8;i++)
+    vst1q_s16(&r->c[8*i],vld1q_s16(&tmp[8*i]));
+}
+
+#undef NCT
+#undef NCT0
+#undef NGS
+
+#else /* AVX-512 (native on x86-64, SIMDe elsewhere) */
+
 void poly_ntt(poly r, const poly a, const pdata prime) {
   size_t i;
   __m512i f[N/32],g[N/32];
@@ -416,6 +688,8 @@ void poly_nttunpack(poly r, const pdata prime) {
   for(i=0;i<N/32;i++)
     _mm512_store_si512(&r->v[i],g[i]);
 }
+
+#endif
 
 static inline void ctbttrfly(__m512i *f, size_t len, __m512i zeta, __m512i zeta_pinv, __m512i p, __m512i pinv) {
   size_t j;
