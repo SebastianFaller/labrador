@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "simd.h"
+#include "parallel.h"
 
 #define AES128CTR_NAMESPACE(s) aes128ctr_avx2_##s
 #define AES256CTR_NAMESPACE(s) aes256ctr_avx2_##s
@@ -41,6 +42,22 @@ void aes128ctr_select(aes128ctr_ctx *state, uint64_t nonce);
 #define aes128ctr_squeezeblocks AES128CTR_NAMESPACE(squeezeblocks)
 void aes128ctr_squeezeblocks(uint8_t *out, size_t nblocks, aes128ctr_ctx *state);
 
+#ifdef LAB_PARALLEL
+/* asynchronous (multi-threaded) squeeze, see aesctr.c */
+typedef struct {
+  uint8_t *out;
+  __m128i n;
+  const __m128i *keys;
+  int rounds;
+  int async;
+} aes128ctr_async;
+
+#define aes128ctr_squeezeblocks_start AES128CTR_NAMESPACE(squeezeblocks_start)
+void aes128ctr_squeezeblocks_start(aes128ctr_async *h, uint8_t *out, size_t nblocks, aes128ctr_ctx *state);
+
+#define aes128ctr_squeezeblocks_finish AES128CTR_NAMESPACE(squeezeblocks_finish)
+void aes128ctr_squeezeblocks_finish(aes128ctr_async *h);
+#endif /* LAB_PARALLEL */
 #define aes256ctr_init AES256CTR_NAMESPACE(init)
 void aes256ctr_init(aes256ctr_ctx *state, const uint8_t key[32], uint64_t nonce);
 

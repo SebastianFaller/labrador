@@ -3,6 +3,7 @@
 #include "polx.h"
 #include "polz.h"
 #include "constraints.h"
+#include "parallel.h"
 #include "comkey.h"
 
 /*
@@ -290,6 +291,7 @@ int sparsecnst_check(
   rotation matrix is aggregated using the polynomial challenges in a and added
   to the corresponding subvector in r.
 */
+#ifndef LAB_PARALLEL
 void polxvec_rotation_aggregate_add(
   polxvec r, 
   const polxvec a, 
@@ -345,7 +347,92 @@ void polxvec_rotation_aggregate_add(
   polxvec_free(tutl);
   polxvec_free(tmp);
 }
+#else
+/* columns [off, off+ncol) of r (one block of deg columns); only reads a, b
+   and writes r[off..off+ncol-1]; tutl (2*deg) and tmp (deg) are scratch */
+static void rotation_aggregate_block(polxvec r, const polxvec a, const polxvec b,
+                                     size_t off, polxvec tutl, polxvec tmp, polx x)
+{
+  size_t rank, deg, row, col, ncol;
+  polxvec r_sv, a_sv, b_sv, tu, tl, tu_sv, tl_sv, tmp_sv;
 
+  rank = a->len;
+  deg = next2power(rank);
+  ncol = MIN(deg, r->len - off);
+  polxvec_init_subvec2(b_sv, b, off, 1, deg);
+  polxvec_init_subvec2(r_sv, r, off, 1, ncol);
+  polxvec_setzero(tutl, 0, 1, 2*ncol);
+  polxvec_init_subvec2(tu, tutl, 0, 1, ncol);
+  polxvec_init_subvec2(tl, tutl, ncol, 1, ncol);
+
+  for(row=0;row<rank;row++){
+    polxvec_init_subvec2(tmp_sv, tmp, 0, 1, deg);
+    polxvec_init_subvec2(a_sv, a, row, 1, 1);
+    polxvec_mul(tmp_sv, a_sv, b_sv);
+
+    for(col=0;col<ncol;col++){
+      if(col<=row){
+        // tl[col] += tmp[row-col]
+        polxvec_init_subvec2(tl_sv, tl, col, 1, 1);
+        polxvec_init_subvec2(tmp_sv, tmp, row-col, 1, 1);
+        polxvec_add(tl_sv, tl_sv, tmp_sv);
+      }
+      else{
+        // tu[col] += tmp[deg+row-col]
+        polxvec_init_subvec2(tu_sv, tu, col, 1, 1);
+        polxvec_init_subvec2(tmp_sv, tmp, deg+row-col, 1, 1);
+        polxvec_add(tu_sv, tu_sv, tmp_sv);
+      }
+    }
+  }
+  polxvec_polx_mul_add(r_sv, x, tu);
+  polxvec_add(r_sv, r_sv, tl);
+}
+
+typedef struct {
+  polxvec_ptr r;
+  const struct polxvec_str *a, *b;
+} rotation_job;
+
+static void rotation_aggregate_blocks(void *arg, size_t begin, size_t end)
+{
+  const rotation_job *job = arg;
+  size_t i, deg = next2power(job->a->len);
+  polxvec tutl, tmp;
+  polx x;
+  polx_monomial(x, 1, 1);
+
+  polxvec_init(tutl, 2*deg, 1);
+  polxvec_init(tmp, deg, 1);
+  for(i=begin;i<end;i++)
+    rotation_aggregate_block(job->r, job->a, job->b, i*deg, tutl, tmp, x);
+  polxvec_free(tutl);
+  polxvec_free(tmp);
+}
+
+/* The blocks of deg output columns are independent and are computed by the
+   same code in any order, so they can be distributed over threads (each with
+   private scratch vectors) when r does not overlap the inputs. */
+void polxvec_rotation_aggregate_add(
+  polxvec r, 
+  const polxvec a, 
+  const polxvec b
+)
+{
+  size_t deg, nblocks;
+  rotation_job job = { r, a, b };
+
+  if(r->len == 0)
+    return;
+  deg = next2power(a->len);
+  nblocks = (r->len + deg - 1)/deg;
+  if(nblocks >= 2 && nblocks*deg*a->len >= 64
+     && polxvec_nooverlap(r, a) && polxvec_nooverlap(r, b))
+    lab_parallel_for(nblocks, 1, rotation_aggregate_blocks, &job);
+  else
+    rotation_aggregate_blocks(&job, 0, nblocks);
+}
+#endif /* LAB_PARALLEL */
 
 /*
   out += c*in, where c->len == in->lin->rank.
@@ -400,6 +487,119 @@ static void sparsecnst_scale_add(
   }
 }
 
+#ifdef LAB_PARALLEL
+/*
+  Multi-threaded version of the full=0 case of sparsecnst_aggregate_add
+  ("owner computes"): the output vector out->lin->phi[0] is split into
+  ranges of elements, balanced by the number of contributions, and every
+  thread applies, for its own range only and in the original order (input
+  constraint i, then part q), the same scale_add operations as the serial
+  loop.  Every output element therefore sees exactly the same sequence of
+  operations (incl. the float width updates); quad and b parts are done
+  serially.  Returns 0 (nothing done) if not worthwhile/applicable.
+*/
+#define AGG_MIN_WORK 256
+#define AGG_MAXPARTS 16
+
+typedef struct {
+  struct _sparsecnst *out;
+  const sparsecnst *in;
+  size_t ncnst;
+  const int64_t *chalz;
+  const size_t *choff;
+  size_t split[AGG_MAXPARTS+1];
+} zqagg_job;
+
+static void zqagg_range(void *arg, size_t begin, size_t end) {
+  const zqagg_job *job = arg;
+  size_t t, i, q, lo, hi, o, a, b;
+  polxvec outphi, inphi;
+
+  for(t=begin;t<end;t++) {
+    lo = job->split[t];
+    hi = job->split[t+1];
+    if(lo >= hi) continue;
+    for(i=0;i<job->ncnst;i++) {
+      const struct _sparsecnst *c = job->in[i];
+      for(q=0;q<c->lin->nparts;q++) {
+        o = c->lin->off[q];
+        a = MAX(o, lo);
+        b = MIN(o + c->lin->phi[q]->len, hi);
+        if(a >= b) continue;
+        polxvec_init_subvec2(outphi, job->out->lin->phi[0], a, 1, b-a);
+        polxvec_init_subvec2(inphi, c->lin->phi[q], a-o, 1, b-a);
+        polxvec_scale_add(outphi, inphi, job->chalz[job->choff[i]]);
+      }
+    }
+  }
+}
+
+static int sparsecnst_scale_aggregate_par(sparsecnst out, const sparsecnst *in,
+                                          size_t ncnst, const int64_t *chalz) {
+  size_t i, q, len, work, nparts, t, acc, e;
+  size_t *w, *choff;
+  zqagg_job job;
+  int ok;
+
+  nparts = (size_t)lab_parallel_nthreads();
+  if(nparts < 2 || ncnst == 0 || out->lin->nparts != 1 || out->lin->off[0] != 0)
+    return 0;
+  if(nparts > AGG_MAXPARTS) nparts = AGG_MAXPARTS;
+  len = out->lin->phi[0]->len;
+  work = 0;
+  ok = 1;
+  for(i=0;i<ncnst && ok;i++)
+    for(q=0;q<in[i]->lin->nparts;q++) {
+      work += in[i]->lin->phi[q]->len;
+      if(in[i]->lin->off[q] + in[i]->lin->phi[q]->len > len
+         || !polxvec_nooverlap(out->lin->phi[0], in[i]->lin->phi[q]))
+        ok = 0;
+    }
+  if(!ok || work < AGG_MIN_WORK)
+    return 0;
+
+  /* number of contributions per output element (difference array) */
+  w = _malloc((len + 1) * sizeof(size_t));
+  memset(w, 0, (len + 1) * sizeof(size_t));
+  choff = _malloc(ncnst * sizeof(size_t));
+  acc = 0;
+  for(i=0;i<ncnst;i++) {
+    choff[i] = acc;
+    acc += in[i]->lin->rank;
+    for(q=0;q<in[i]->lin->nparts;q++) {
+      w[in[i]->lin->off[q]] += 1;
+      w[in[i]->lin->off[q] + in[i]->lin->phi[q]->len] -= 1;
+    }
+  }
+  /* split points with balanced cumulative work (depends only on the
+     public constraint shapes) */
+  job.split[0] = 0;
+  t = 1;
+  acc = 0;
+  for(e=0, i=0;e<len && t<nparts;e++) {
+    i += w[e];       /* contributions to element e */
+    acc += i;
+    while(t < nparts && acc*nparts >= work*t)
+      job.split[t++] = e + 1;
+  }
+  while(t <= nparts)
+    job.split[t++] = len;
+
+  /* quad and b parts: serial, original order */
+  for(i=0;i<ncnst;i++) {
+    quadfunc_scale_add(out->quad, in[i]->quad, chalz[choff[i]]);
+    polxvec_scale_add(out->b, in[i]->b, chalz[choff[i]]);
+  }
+
+  job.out = out; job.in = in; job.ncnst = ncnst; job.chalz = chalz; job.choff = choff;
+  lab_parallel_for(nparts, 1, zqagg_range, &job);
+
+  free(choff);
+  free(w);
+  return 1;
+}
+#endif /* LAB_PARALLEL */
+
 /* 
   Add aggregation of all the input constraints into a single constraint.
     - out: single output constraint, over the base ring, with rank 1, and one
@@ -426,6 +626,10 @@ void sparsecnst_aggregate_add(
 {
   size_t i, off;
   polxvec chal_sv;
+#ifdef LAB_PARALLEL
+  if(!full && sparsecnst_scale_aggregate_par(out, in, ncnst, chalz))
+    return;
+#endif /* LAB_PARALLEL */
 
   off = 0;
   for(i=0;i<ncnst;i++){

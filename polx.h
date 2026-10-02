@@ -3,6 +3,7 @@
 
 #include "data.h"
 #include "poly.h"
+#include "parallel.h"
 
 struct polx_str {
   double width;
@@ -120,4 +121,7 @@ void polxvec_sigma5inv(polxvec r, const polxvec a);
 void polx_flip(polx r, const polx a);
 void polxvec_flip(polxvec r, const polxvec a);
 
+#ifdef LAB_PARALLEL
+int polxvec_nooverlap(const polxvec r, const polxvec a);
+#endif /* LAB_PARALLEL */
 #endif

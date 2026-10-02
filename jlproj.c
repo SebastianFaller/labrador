@@ -7,6 +7,7 @@
 #include "data.h"
 #include "polz.h"
 #include "jlproj.h"
+#include "parallel.h"
 
 /* Substracting 2 iid random variables with P(-1)=0.5, P(1)=0.5
  * gives random variable with P(-2)=0.25, P(0)=0.5, P(2)=0.25.
@@ -31,6 +32,36 @@ void polyvec_jlproj_add_bin1(
   for (i = 0; i < 256; i++)
     r[i] >>= 1;
 }
+
+#ifdef LAB_PARALLEL
+/* Multi-threaded polyvec_jlproj_add: r[k] += sum_i <row k of M_i, p_i> is a sum
+ * of int32 terms that wraps mod 2^32 (-fwrapv, and exactly the wrapping
+ * semantics of jlproj_add64), so splitting the polynomials into ranges with
+ * separate partial sums and adding the partials gives the identical result.
+ * Thread scheduling only depends on len (public). */
+#define JLPROJ_PAR_MIN 32
+#define JLPROJ_MAXPARTS 16
+
+static void polyvec_jlproj_add_ser(int32_t r[256], const poly *p, size_t len, const uint8_t *mat);
+
+typedef struct {
+  const poly *p;
+  const uint8_t *mat;
+  size_t nparts, len;
+  int32_t (*part)[256];
+} jlproj_job;
+
+static void jlproj_part(void *arg, size_t begin, size_t end) {
+  const jlproj_job *job = arg;
+  size_t t;
+
+  for(t=begin;t<end;t++) {
+    size_t lo = job->len*t/job->nparts, hi = job->len*(t+1)/job->nparts;
+    memset(job->part[t],0,sizeof(job->part[t]));
+    polyvec_jlproj_add_ser(job->part[t],&job->p[lo],hi-lo,&job->mat[256*N/8*lo]);
+  }
+}
+#endif /* LAB_PARALLEL */
 
 /* matrix format (32x16):
  * 4 bits -> nibble: 8 row stride
@@ -370,12 +401,32 @@ void poly_jlproj_add(int32_t out[256], const poly in, const uint8_t mat[256*N/8]
     jlproj_add64(out,&in->c[64*i],&mat[2048*i]);
 }
 
-void polyvec_jlproj_add(int32_t r[256], const poly *p, size_t len, const uint8_t *mat) {
+LAB_SERIAL(polyvec_jlproj_add)(int32_t r[256], const poly *p, size_t len, const uint8_t *mat) {
   size_t i;
 
   for(i=0;i<len;i++)
     poly_jlproj_add(r,p[i],&mat[256*N/8*i]);
 }
+
+#ifdef LAB_PARALLEL
+void polyvec_jlproj_add(int32_t r[256], const poly *p, size_t len, const uint8_t *mat) {
+  size_t i, t, nparts;
+  alignas(64) int32_t part[JLPROJ_MAXPARTS][256];
+  jlproj_job job;
+
+  nparts = (size_t)lab_parallel_nthreads();
+  if(nparts > JLPROJ_MAXPARTS) nparts = JLPROJ_MAXPARTS;
+  if(len < JLPROJ_PAR_MIN || nparts < 2) {
+    polyvec_jlproj_add_ser(r,p,len,mat);
+    return;
+  }
+  job.p = p; job.mat = mat; job.nparts = nparts; job.len = len; job.part = part;
+  lab_parallel_for(nparts,1,jlproj_part,&job);
+  for(t=0;t<nparts;t++)
+    for(i=0;i<256;i++)
+      r[i] = (int32_t)((uint32_t)r[i] + (uint32_t)part[t][i]);
+}
+#endif /* LAB_PARALLEL */
 
 static void jlproj_collapsmat32(int64_t *row, const uint8_t *mat, size_t len, const int64_t alpha[32]) {
   size_t i;
@@ -702,6 +753,7 @@ static void jl_decompose(polz *t, const int64_t *raw, size_t cnt) {
   }
 }
 
+#ifndef LAB_PARALLEL
 void polxvec_jlproj_collapsmat(polxvec r, const uint8_t *mat, const int64_t alpha[256]) {
   size_t i;
   alignas(64) int64_t raw[16*N];
@@ -730,6 +782,39 @@ void polxvec_jlproj_collapsmat(polxvec r, const uint8_t *mat, const int64_t alph
     polzvec_topolxvec(r,t,rpos,1,len);
   }
 }
+#else
+typedef struct {
+  polxvec_ptr r;
+  const uint8_t *mat;
+  const int64_t *alpha;
+} collapsmat_job;
+
+/* blocks [begin,end) of 16 output polynomials; block b only reads
+ * mat[256*16*N/8*b ...] and only writes r[16*b ... 16*b+15] */
+static void collapsmat_blocks(void *arg, size_t begin, size_t end) {
+  const collapsmat_job *job = arg;
+  size_t i, b, cnt;
+  alignas(64) int64_t raw[16*N];
+  polz t[16];
+
+  for(b=begin;b<end;b++) {
+    const uint8_t *mat = &job->mat[256*16*N/8*b];
+    cnt = MIN(16, job->r->len - 16*b);
+    memset(raw,0,sizeof(int64_t)*cnt*N);
+    for(i=0;i<256/32;i++)
+      jlproj_collapsmat32(raw,&mat[32*16/8*i],cnt*N,&job->alpha[32*i]);
+    jl_decompose(t,raw,cnt);
+    polzvec_sigmam1(t,t,cnt);
+    polzvec_topolxvec(job->r,t,16*b,1,cnt);
+  }
+}
+
+void polxvec_jlproj_collapsmat(polxvec r, const uint8_t *mat, const int64_t alpha[256]) {
+  collapsmat_job job = { r, mat, alpha };
+
+  lab_parallel_for((r->len+15)/16,1,collapsmat_blocks,&job);
+}
+#endif /* LAB_PARALLEL */
 #else
 void polxvec_jlproj_collapsmat(polxvec r, const uint8_t *mat, const int64_t alpha[256]) {
   size_t i,j,k;

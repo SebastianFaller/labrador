@@ -13,6 +13,8 @@ endif
 SIMDE_DIR ?= ../../third_party/simde-d4d85e3
 ifneq ($(shell uname -m),x86_64)
 CFLAGS += -I$(SIMDE_DIR) -DSIMDE_ENABLE_NATIVE_ALIASES -Werror=implicit-function-declaration
+# aarch64: multi-threaded prover/verifier (parallel.h)
+CFLAGS += -pthread
 else ifeq ($(PORTABLE),1)
 CFLAGS += -I$(SIMDE_DIR) -DSIMDE_ENABLE_NATIVE_ALIASES -DLAZER_PORTABLE -DSIMDE_NO_NATIVE \
   -Werror=implicit-function-declaration
@@ -27,7 +29,8 @@ SOURCES = aesctr.c comkey.c constraints.c cpucycles.c dachshund.c data.c \
 HEADERS = aesctr.h comkey.h constraints.h cpucycles.h dachshund.h data.h \
 	fips202.h gaussian.h jlproj.h labradoodle.h labrador_core.h \
 	labrador_tail.h labrador.h pack.h polx.h poly.h polz.h proofsystem.h \
-	randombytes.h rejection.h malloc.h labrados_python.h timing.h
+	randombytes.h rejection.h malloc.h labrados_python.h timing.h \
+	simd.h simd_neon.h parallel.h
 
 .PHONY: all
 
