@@ -2,6 +2,7 @@
 #include <stdalign.h>
 #include <stdio.h>
 #include "simd.h"
+#include "simd_neon.h"
 #include <math.h>
 #include <complex.h>
 #include "aesctr.h"
@@ -62,6 +63,17 @@ void poly_setzero(poly r) {
     _mm512_store_si512(&r->v[i],zero);
 }
 
+#ifdef LABRADOS_NEON
+void polyvec_setzero(poly *r, ssize_t stride, size_t len) {
+  size_t i;
+
+  if(stride == 1)
+    memset(r[0]->c,0,len*sizeof(poly));
+  else
+    for(i=0;i<len;i++)
+      memset(r[i*stride]->c,0,sizeof(poly));
+}
+#else
 void polyvec_setzero(poly *r, ssize_t stride, size_t len) {
   size_t i,j;
   const __m512i zero = _mm512_setzero_si512();
@@ -70,6 +82,7 @@ void polyvec_setzero(poly *r, ssize_t stride, size_t len) {
     for(j=0;j<N/32;j++)
       _mm512_store_si512(&r[i*stride]->v[j],zero);
 }
+#endif
 
 int polyvec_isbinary(const poly *r, ssize_t stride, size_t len) {
   int64_t ret = 0;
@@ -482,6 +495,25 @@ double polyvec_norm(const poly *a, ssize_t stride, size_t len) {
   return sqrt((double)polyvec_sprodz(a,a,stride,stride,len));
 }
 
+#ifdef LABRADOS_NEON
+/* NEON: g = mulhrs(mulhi(f,v),16) = round(floor(f*v/2^16)/2^11) = round(sqdmulh(f,v)/2^12)
+ * (exact: v is positive, so sqdmulh never saturates), f -= g*p (16-bit wrapping). */
+void poly_reduce(poly r, const pdata prime) {
+  size_t i;
+  const int16x8_t p = vdupq_n_s16(prime->p);
+  const int16x8_t v = vdupq_n_s16(prime->v);
+  _Static_assert(16+15-27 == 4, "poly_reduce: mulhrs shift constant");
+
+  for(i=0;i<N/16;i++) {
+    int16x8_t f0 = vld1q_s16(&r->c[16*i]);
+    int16x8_t f1 = vld1q_s16(&r->c[16*i+8]);
+    int16x8_t g0 = vrshrq_n_s16(vqdmulhq_s16(f0,v),12);
+    int16x8_t g1 = vrshrq_n_s16(vqdmulhq_s16(f1,v),12);
+    vst1q_s16(&r->c[16*i],vmlsq_s16(f0,g0,p));
+    vst1q_s16(&r->c[16*i+8],vmlsq_s16(f1,g1,p));
+  }
+}
+#else
 void poly_reduce(poly r, const pdata prime) {
   size_t i;
   __m512i f,g;
@@ -498,6 +530,7 @@ void poly_reduce(poly r, const pdata prime) {
     _mm512_store_si512(&r->v[i],f);
   }
 }
+#endif
 
 void polyvec_reduce(poly *r, ssize_t stride, size_t len, const pdata prime) {
   size_t i;
@@ -549,6 +582,21 @@ void polyvec_csubp(poly *r, ssize_t stride, size_t len, const pdata prime) {
     poly_csubp(r[stride*i],prime);
 }
 
+#ifdef LABRADOS_NEON
+void poly_caddp(poly r, const pdata prime) {
+  size_t i;
+  const int16x8_t p = vdupq_n_s16(prime->p);
+
+  for(i=0;i<N/16;i++) {
+    int16x8_t f0 = vld1q_s16(&r->c[16*i]);
+    int16x8_t f1 = vld1q_s16(&r->c[16*i+8]);
+    f0 = vaddq_s16(f0,vandq_s16(vshrq_n_s16(f0,15),p));
+    f1 = vaddq_s16(f1,vandq_s16(vshrq_n_s16(f1,15),p));
+    vst1q_s16(&r->c[16*i],f0);
+    vst1q_s16(&r->c[16*i+8],f1);
+  }
+}
+#else
 void poly_caddp(poly r, const pdata prime) {
   size_t i;
   __m512i f;
@@ -562,6 +610,7 @@ void poly_caddp(poly r, const pdata prime) {
     _mm512_store_si512(&r->v[i],f);
   }
 }
+#endif
 
 void polyvec_caddp(poly *r, ssize_t stride, size_t len, const pdata prime) {
   size_t i;
@@ -570,6 +619,21 @@ void polyvec_caddp(poly *r, ssize_t stride, size_t len, const pdata prime) {
     poly_caddp(r[stride*i],prime);
 }
 
+#ifdef LABRADOS_NEON
+void poly_quot_add(poly r, const poly a, const pdata prime) {
+  size_t i;
+  const int16x8_t v = vdupq_n_s16(prime->v);  // v > 0: sqdmulh does not saturate
+
+  for(i=0;i<N/16;i++) {
+    int16x8_t f0 = vld1q_s16(&a->c[16*i]);
+    int16x8_t f1 = vld1q_s16(&a->c[16*i+8]);
+    int16x8_t g0 = vld1q_s16(&r->c[16*i]);
+    int16x8_t g1 = vld1q_s16(&r->c[16*i+8]);
+    vst1q_s16(&r->c[16*i],vsraq_n_s16(g0,vqdmulhq_s16(f0,v),1));
+    vst1q_s16(&r->c[16*i+8],vsraq_n_s16(g1,vqdmulhq_s16(f1,v),1));
+  }
+}
+#else
 void poly_quot_add(poly r, const poly a, const pdata prime) {
   size_t i;
   __m512i f,g;
@@ -583,6 +647,7 @@ void poly_quot_add(poly r, const poly a, const pdata prime) {
     _mm512_store_si512(&r->v[i],f);
   }
 }
+#endif
 
 void polyvec_quot_add(poly *r, const poly *a, ssize_t stride_r, ssize_t stride_a, size_t len, const pdata prime) {
   size_t i;
@@ -699,6 +764,31 @@ void polyvec_invntt(poly *r, const poly *a, ssize_t stride_r, ssize_t stride_a, 
     poly_invntt(r[stride_r*i],a[stride_a*i],prime);
 }
 
+#ifdef LABRADOS_NEON
+/* Montgomery product hi(ab) - hi(lo(ab)*pinv*p): the 32-bit products are computed
+ * exactly with widening multiplies (a, b arbitrary), the second high product with
+ * sqdmulh (exact since 0 < p < 2^15). lo(lo(ab)*pinv) == lo(lo(a*b)*pinv) as in AVX. */
+static inline int16x8_t neon_montmul(int16x8_t f, int16x8_t g, int16x8_t pinv, int16x8_t p) {
+  return neon_montred32(vmull_s16(vget_low_s16(f),vget_low_s16(g)),vmull_high_s16(f,g),pinv,p);
+}
+
+void poly_pointwise(poly r, const poly a, const poly b, const pdata prime) {
+  size_t i;
+  const int16x8_t p = vdupq_n_s16(prime->p);
+  const int16x8_t pinv = vdupq_n_s16(prime->pinv);
+
+  for(i=0;i<N/32;i++) {
+    int16x8_t f0 = neon_montmul(vld1q_s16(&a->c[32*i+ 0]),vld1q_s16(&b->c[32*i+ 0]),pinv,p);
+    int16x8_t f1 = neon_montmul(vld1q_s16(&a->c[32*i+ 8]),vld1q_s16(&b->c[32*i+ 8]),pinv,p);
+    int16x8_t f2 = neon_montmul(vld1q_s16(&a->c[32*i+16]),vld1q_s16(&b->c[32*i+16]),pinv,p);
+    int16x8_t f3 = neon_montmul(vld1q_s16(&a->c[32*i+24]),vld1q_s16(&b->c[32*i+24]),pinv,p);
+    vst1q_s16(&r->c[32*i+ 0],f0);
+    vst1q_s16(&r->c[32*i+ 8],f1);
+    vst1q_s16(&r->c[32*i+16],f2);
+    vst1q_s16(&r->c[32*i+24],f3);
+  }
+}
+#else
 void poly_pointwise(poly r, const poly a, const poly b, const pdata prime) {
   size_t i;
   __m512i f,g,h;
@@ -716,6 +806,7 @@ void poly_pointwise(poly r, const poly a, const poly b, const pdata prime) {
     _mm512_store_si512(&r->v[i],f);
   }
 }
+#endif
 
 void polyvec_pointwise(poly *r, const poly *a, const poly *b,
                        ssize_t stride_r, ssize_t stride_a, ssize_t stride_b, size_t len, const pdata prime)
@@ -726,6 +817,24 @@ void polyvec_pointwise(poly *r, const poly *a, const poly *b,
     poly_pointwise(r[stride_r*i],a[stride_a*i],b[stride_b*i],prime);
 }
 
+#ifdef LABRADOS_NEON
+void polyvec_poly_pointwise(poly *r, const poly a, const poly *b,
+                                ssize_t stride_r, ssize_t stride_b, size_t len, const pdata prime)
+{
+  size_t i,j;
+  const int16x8_t p = vdupq_n_s16(prime->p);
+  const int16x8_t pinv = vdupq_n_s16(prime->pinv);
+
+  for(i=0;i<len;i++) {
+    const int16_t *bi = b[stride_b*i]->c;
+    int16_t *ri = r[stride_r*i]->c;
+    for(j=0;j<N/8;j++) {
+      int16x8_t f = neon_montmul(vld1q_s16(&bi[8*j]),vld1q_s16(&a->c[8*j]),pinv,p);
+      vst1q_s16(&ri[8*j],f);
+    }
+  }
+}
+#else
 void polyvec_poly_pointwise(poly *r, const poly a, const poly *b,
                             ssize_t stride_r, ssize_t stride_b, size_t len, const pdata prime)
 {
@@ -751,7 +860,21 @@ void polyvec_poly_pointwise(poly *r, const poly a, const poly *b,
     }
   }
 }
+#endif
 
+#ifdef LABRADOS_NEON
+void poly_pointwise_add(poly r, const poly a, const poly b, const pdata prime) {
+  size_t i;
+  const int16x8_t p = vdupq_n_s16(prime->p);
+  const int16x8_t pinv = vdupq_n_s16(prime->pinv);
+
+  /* AVX: (hi(ab) + r) - hi(t*p); 16-bit wrapping adds commute */
+  for(i=0;i<N/8;i++) {
+    int16x8_t f = neon_montmul(vld1q_s16(&a->c[8*i]),vld1q_s16(&b->c[8*i]),pinv,p);
+    vst1q_s16(&r->c[8*i],vaddq_s16(f,vld1q_s16(&r->c[8*i])));
+  }
+}
+#else
 void poly_pointwise_add(poly r, const poly a, const poly b, const pdata prime) {
   size_t i;
   __m512i f,g,h;
@@ -771,6 +894,7 @@ void poly_pointwise_add(poly r, const poly a, const poly b, const pdata prime) {
     _mm512_store_si512(&r->v[i],f);
   }
 }
+#endif
 
 void polyvec_pointwise_add(poly *r, const poly *a, const poly *b,
                            ssize_t stride_r, ssize_t stride_a, ssize_t stride_b, size_t len, const pdata prime)
@@ -781,6 +905,25 @@ void polyvec_pointwise_add(poly *r, const poly *a, const poly *b,
     poly_pointwise_add(r[stride_r*i],a[stride_a*i],b[stride_b*i],prime);
 }
 
+#ifdef LABRADOS_NEON
+void polyvec_poly_pointwise_add(poly *r, const poly a, const poly *b,
+                                ssize_t stride_r, ssize_t stride_b, size_t len, const pdata prime)
+{
+  size_t i,j;
+  const int16x8_t p = vdupq_n_s16(prime->p);
+  const int16x8_t pinv = vdupq_n_s16(prime->pinv);
+
+  for(i=0;i<len;i++) {
+    const int16_t *bi = b[stride_b*i]->c;
+    int16_t *ri = r[stride_r*i]->c;
+    for(j=0;j<N/8;j++) {
+      int16x8_t f = neon_montmul(vld1q_s16(&bi[8*j]),vld1q_s16(&a->c[8*j]),pinv,p);
+      f = vaddq_s16(f,vld1q_s16(&ri[8*j]));
+      vst1q_s16(&ri[8*j],f);
+    }
+  }
+}
+#else
 void polyvec_poly_pointwise_add(poly *r, const poly a, const poly *b,
                                 ssize_t stride_r, ssize_t stride_b, size_t len, const pdata prime)
 {
@@ -808,6 +951,7 @@ void polyvec_poly_pointwise_add(poly *r, const poly a, const poly *b,
     }
   }
 }
+#endif
 
 static inline void polyvec_sprod_add_pair(__m512i *z, const poly *a, const poly *b,
                                           ssize_t stride_z, ssize_t stride_a, ssize_t stride_b)
@@ -961,6 +1105,73 @@ static inline void polyvec_interleave_reduce_add(poly *r, __m512i *a, ssize_t st
   }
 }
 
+#ifdef LABRADOS_NEON
+/* z[c] += sum_i a_i[c]*b_i[c] with 32-bit wrapping accumulation (same as vpdpwssd) */
+static void neon_sprod_acc(int32_t z[N], const poly *a, const poly *b,
+                           ssize_t stride_a, ssize_t stride_b, size_t len)
+{
+  size_t i,c;
+
+  for(c=0;c<N;c+=32) {
+    int32x4_t z0 = vld1q_s32(&z[c+ 0]), z1 = vld1q_s32(&z[c+ 4]);
+    int32x4_t z2 = vld1q_s32(&z[c+ 8]), z3 = vld1q_s32(&z[c+12]);
+    int32x4_t z4 = vld1q_s32(&z[c+16]), z5 = vld1q_s32(&z[c+20]);
+    int32x4_t z6 = vld1q_s32(&z[c+24]), z7 = vld1q_s32(&z[c+28]);
+    for(i=0;i<len;i++) {
+      const int16_t *pa = &a[stride_a*i]->c[c];
+      const int16_t *pb = &b[stride_b*i]->c[c];
+      int16x8_t a0 = vld1q_s16(pa+ 0), b0 = vld1q_s16(pb+ 0);
+      int16x8_t a1 = vld1q_s16(pa+ 8), b1 = vld1q_s16(pb+ 8);
+      int16x8_t a2 = vld1q_s16(pa+16), b2 = vld1q_s16(pb+16);
+      int16x8_t a3 = vld1q_s16(pa+24), b3 = vld1q_s16(pb+24);
+      z0 = vmlal_s16(z0,vget_low_s16(a0),vget_low_s16(b0));
+      z1 = vmlal_high_s16(z1,a0,b0);
+      z2 = vmlal_s16(z2,vget_low_s16(a1),vget_low_s16(b1));
+      z3 = vmlal_high_s16(z3,a1,b1);
+      z4 = vmlal_s16(z4,vget_low_s16(a2),vget_low_s16(b2));
+      z5 = vmlal_high_s16(z5,a2,b2);
+      z6 = vmlal_s16(z6,vget_low_s16(a3),vget_low_s16(b3));
+      z7 = vmlal_high_s16(z7,a3,b3);
+    }
+    vst1q_s32(&z[c+ 0],z0); vst1q_s32(&z[c+ 4],z1);
+    vst1q_s32(&z[c+ 8],z2); vst1q_s32(&z[c+12],z3);
+    vst1q_s32(&z[c+16],z4); vst1q_s32(&z[c+20],z5);
+    vst1q_s32(&z[c+24],z6); vst1q_s32(&z[c+28],z7);
+  }
+}
+
+void polyvec_sprod_pointwise(poly r, const poly *a, const poly *b,
+                             ssize_t stride_a, ssize_t stride_b, size_t len, const pdata prime)
+{
+  size_t i;
+  size_t chunk = floor(pow(ldexp(1/3.2,31)/(prime->p*prime->p),2));  // 12*sqrt(2*k)*(1.5*p)^2/12<2^31
+  int32_t z[N] __attribute__((aligned(16)));
+  const int16x8_t p = vdupq_n_s16(prime->p);
+  const int16x8_t pinv = vdupq_n_s16(prime->pinv);
+  const int16x8_t mont = vdupq_n_s16(prime->mont);
+
+  for(i=0;i<N;i++)
+    z[i] = 0;
+  while((chunk = MIN(chunk,len) & ~(size_t)1)) {
+    neon_sprod_acc(z,a,b,stride_a,stride_b,chunk);
+    /* reduce_mul_add(z,NULL,z,mont): z = mont*montred(z) */
+    for(i=0;i<N/8;i++) {
+      int16x8_t t = neon_montred32(vld1q_s32(&z[8*i]),vld1q_s32(&z[8*i+4]),pinv,p);
+      vst1q_s32(&z[8*i],vmull_s16(vget_low_s16(t),vget_low_s16(mont)));
+      vst1q_s32(&z[8*i+4],vmull_high_s16(t,mont));
+    }
+    a += chunk*stride_a;
+    b += chunk*stride_b;
+    len -= chunk;
+  }
+  for(i=0;i<N/8;i++)
+    vst1q_s16(&r->c[8*i],neon_montred32(vld1q_s32(&z[8*i]),vld1q_s32(&z[8*i+4]),pinv,p));
+  if(len) {
+    poly_pointwise_add(r,a[0],b[0],prime);
+    poly_reduce(r,prime);
+  }
+}
+#else
 void polyvec_sprod_pointwise(poly r, const poly *a, const poly *b,
                              ssize_t stride_a, ssize_t stride_b, size_t len, const pdata prime)
 {
@@ -985,6 +1196,7 @@ void polyvec_sprod_pointwise(poly r, const poly *a, const poly *b,
     poly_reduce(r,prime);
   }
 }
+#endif
 
 void polyvec_sprod_pointwise_add(poly r, const poly *a, const poly *b,
                                  ssize_t stride_a, ssize_t stride_b, size_t len, const pdata prime)
@@ -1186,6 +1398,104 @@ static inline void doubleschoolbook_conj(__m512i *c, __m512i *a, __m512i *b, siz
     _mm512_store_si512(&c[i],h[i]);
 }
 
+#ifdef LABRADOS_NEON
+/* NEON: same algorithm as the AVX-512 code (doubleschoolbook on pairs (a_k, a_{k+deg})
+ * with 32-bit wrapping accumulation, Montgomery reductions at the same points), but
+ * in natural coefficient order instead of the even/odd interleaved 32-bit layout.
+ * Everything is coefficient-wise, so the layout does not change any result. */
+static void neon_schoolbook8(int32_t *cc, size_t co, const poly *a, const poly *b,
+                             ssize_t stride_a, ssize_t stride_b, size_t deg, size_t clen, size_t blen,
+                             int paired, int16x8_t x, int16x8_t mont, int16x8_t pinv, int16x8_t p)
+{
+  size_t i,j;
+  const size_t olen = MIN(clen,blen-1);
+  int32x4_t hl[clen+olen], hh[clen+olen];
+
+  for(i=0;i<clen;i++) {
+    hl[i] = vld1q_s32(&cc[N*i+co]);
+    hh[i] = vld1q_s32(&cc[N*i+co+4]);
+  }
+  for(i=0;i<olen;i++)
+    hl[clen+i] = hh[clen+i] = vdupq_n_s32(0);
+
+#define MAC(H,K) do {                                                          \
+    int16x8_t g_ = vld1q_s16(&a[(K)*stride_a]->c[co]);                        \
+    hl[H] = vmlal_s16(hl[H],vget_low_s16(f),vget_low_s16(g_));                \
+    hh[H] = vmlal_high_s16(hh[H],f,g_);                                       \
+    if(paired) {                                                              \
+      g_ = vld1q_s16(&a[((K)+deg)*stride_a]->c[co]);                          \
+      hl[H] = vmlal_s16(hl[H],vget_low_s16(f2),vget_low_s16(g_));             \
+      hh[H] = vmlal_high_s16(hh[H],f2,g_);                                    \
+    }                                                                         \
+  } while(0)
+
+  for(j=0;j<blen;j++) {
+    const int16x8_t f = vld1q_s16(&b[j*stride_b]->c[co]);
+    const int16x8_t f2 = paired ? vld1q_s16(&b[(j+deg)*stride_b]->c[co]) : f;
+    for(i=0;i<j && i<clen;i++)
+      MAC(clen+i,deg+i-j);
+    for(i=j;i<deg && i<clen;i++)
+      MAC(i,i-j);
+  }
+#undef MAC
+
+  /* reduce_mul_add(&h[0],&h[0],&h[clen],x,olen): h[i] += x*montred(h[clen+i]) */
+  for(i=0;i<olen;i++) {
+    int16x8_t t = neon_montred32(hl[clen+i],hh[clen+i],pinv,p);
+    hl[i] = vmlal_s16(hl[i],vget_low_s16(x),vget_low_s16(t));
+    hh[i] = vmlal_high_s16(hh[i],x,t);
+  }
+  /* reduce_mul_add(&h[0],NULL,&h[0],mont,clen): h[i] = mont*montred(h[i]) */
+  for(i=0;i<clen;i++) {
+    int16x8_t t = neon_montred32(hl[i],hh[i],pinv,p);
+    vst1q_s32(&cc[N*i+co],vmull_s16(vget_low_s16(mont),vget_low_s16(t)));
+    vst1q_s32(&cc[N*i+co+4],vmull_high_s16(mont,t));
+  }
+}
+
+void polyvec_sprod_extension(poly *c, const poly *a, const poly *b,
+                             ssize_t stride_c, ssize_t stride_a, ssize_t stride_b,
+                             size_t deg, size_t clen, size_t blen,
+                             const pdata prime)
+{
+  size_t i,j,co;
+  poly x;
+  int32_t cc[clen*N] __attribute__((aligned(16)));
+  const int16x8_t p = vdupq_n_s16(prime->p);
+  const int16x8_t pinv = vdupq_n_s16(prime->pinv);
+  const int16x8_t mont = vdupq_n_s16(prime->mont);
+
+  /* shortcut */
+  if(deg == 1) {
+    polyvec_sprod_pointwise(c[0],a,b,stride_a,stride_b,blen,prime);
+    return;
+  }
+
+  for(i=0;i<clen*N;i++)
+    cc[i] = 0;
+  poly_monomial_ntt(x,1,1,prime);
+  while(blen >= 2*deg) {
+    for(co=0;co<N;co+=8)
+      neon_schoolbook8(cc,co,a,b,stride_a,stride_b,deg,clen,deg,1,vld1q_s16(&x->c[co]),mont,pinv,p);
+    a += 2*deg*stride_a;
+    b += 2*deg*stride_b;
+    blen -= 2*deg;
+  }
+
+  while(blen) {
+    j = MIN(blen,deg);
+    for(co=0;co<N;co+=8)
+      neon_schoolbook8(cc,co,a,b,stride_a,stride_b,deg,clen,j,0,vld1q_s16(&x->c[co]),mont,pinv,p);
+    a += deg*stride_a;
+    b += j*stride_b;
+    blen -= j;
+  }
+
+  for(i=0;i<clen;i++)
+    for(co=0;co<N;co+=8)
+      vst1q_s16(&c[stride_c*i]->c[co],neon_montred32(vld1q_s32(&cc[N*i+co]),vld1q_s32(&cc[N*i+co+4]),pinv,p));
+}
+#else
 void polyvec_sprod_extension(poly *c, const poly *a, const poly *b,
                              ssize_t stride_c, ssize_t stride_a, ssize_t stride_b,
                              size_t deg, size_t clen, size_t blen,
@@ -1229,6 +1539,7 @@ void polyvec_sprod_extension(poly *c, const poly *a, const poly *b,
 
   polyvec_interleave_reduce(c,cc,stride_c,clen,prime);
 }
+#endif
 
 void polyvec_collaps_add_extension(poly *c, const poly *b, const poly *a,
                                    ssize_t stride_c, ssize_t stride_b, ssize_t stride_a,
@@ -1412,6 +1723,33 @@ void polyvec_pairwise_sprod(poly *g, const poly *a, const poly *b, size_t r, siz
     polyvec_pairwise_doubleoffdiag(g,r,prime);
 }
 
+#ifdef LABRADOS_NEON
+void poly_scale(poly r, const poly a, int16_t s, const pdata prime) {
+  size_t i;
+  const int16x8_t l = vdupq_n_s16(s*prime->pinv);
+  const int16x8_t h = vdupq_n_s16(s);
+  const int16x8_t p = vdupq_n_s16(prime->p);
+
+  if(s == INT16_MIN) {  // public scalar; sqdmulh could saturate
+    for(i=0;i<N/8;i++) {
+      int16x8_t f = vld1q_s16(&a->c[8*i]);
+      int16x8_t g = vmulq_s16(f,l);
+      vst1q_s16(&r->c[8*i],vsubq_s16(neon_mulhi_s16(f,h),neon_mulhi_s16_c(g,p)));
+    }
+    return;
+  }
+  for(i=0;i<N/16;i++) {
+    int16x8_t f0 = vld1q_s16(&a->c[16*i]);
+    int16x8_t f1 = vld1q_s16(&a->c[16*i+8]);
+    int16x8_t g0 = vmulq_s16(f0,l);
+    int16x8_t g1 = vmulq_s16(f1,l);
+    f0 = vsubq_s16(neon_mulhi_s16_c(f0,h),neon_mulhi_s16_c(g0,p));
+    f1 = vsubq_s16(neon_mulhi_s16_c(f1,h),neon_mulhi_s16_c(g1,p));
+    vst1q_s16(&r->c[16*i],f0);
+    vst1q_s16(&r->c[16*i+8],f1);
+  }
+}
+#else
 void poly_scale(poly r, const poly a, int16_t s, const pdata prime) {
   size_t i;
   __m512i f,g;
@@ -1428,6 +1766,7 @@ void poly_scale(poly r, const poly a, int16_t s, const pdata prime) {
     _mm512_store_si512(&r->v[i],f);
   }
 }
+#endif
 
 void polyvec_scale(poly *r, const poly *a, ssize_t stride_r, ssize_t stride_a, size_t len, int16_t s, const pdata prime) {
   size_t i;
