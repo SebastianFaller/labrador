@@ -39,23 +39,83 @@ static const z128 CDF155[]
         { 0ULL, 98ULL },
         { 0ULL, 0ULL } };
 
-// Buffered randomness: squeeze 512 bytes at a time
+// Buffered randomness: logically the stream is consumed in 512-byte blocks
+// exactly as before (a request that does not fit into the rest of the current
+// block skips to the next block).  Physically, consecutive blocks of the same
+// AES-CTR stream are generated ahead in batches, double-buffered: while the
+// sampler consumes one batch, the worker threads generate the next one
+// (aes128ctr_squeezeblocks_start/finish).  The bytes handed out are identical
+// to squeezing one block at a time; only the final position of the AES
+// counter differs, and the state is not used after gaussian_i32.  The number
+// of batches depends on the number of rejections, like the number of AES
+// calls of the original code.
 // (cdfsampler needs 16 bytes, ber_exp needs 16 bytes, sign bit needs 1 bit)
+#define RB_BATCH 128  // blocks per batch (64 KiB)
+#define RB_MIN 8      // minimum batch once the estimate is exhausted
+
 typedef struct {
-  uint8_t buf[AES128CTR_BLOCKBYTES];
+  const uint8_t *buf; // current 512-byte block
   size_t pos;    // byte position in buf
   uint64_t bits; // cached bits for single-bit extraction
   size_t bpos;   // bit position (0..63), 64 = empty
+  uint8_t *big[2]; // double buffer of pre-generated blocks (RB_BATCH each)
+  int cur;       // buffer being consumed
+  size_t blk;    // index of the current block in big[cur]
+  size_t nblk;   // number of valid blocks in big[cur]
+  size_t nnext;  // number of blocks being generated into big[cur^1], 0 = none
+  size_t left;   // estimated number of blocks still needed
+  aes128ctr_async h;
 } randbuf;
 
-// empty, refill on first use
-static inline void randbuf_init(randbuf *rb) {
+// empty, refill on first use; est = expected number of blocks needed
+static inline void randbuf_init(randbuf *rb, size_t est) {
   rb->pos = AES128CTR_BLOCKBYTES;
   rb->bpos = 64;
+  rb->big[0] = _malloc(2 * RB_BATCH * AES128CTR_BLOCKBYTES);
+  rb->big[1] = rb->big[0] + RB_BATCH * AES128CTR_BLOCKBYTES;
+  rb->cur = 0;
+  rb->blk = rb->nblk = rb->nnext = 0;
+  rb->left = est;
+  rb->buf = NULL;
+  rb->h.async = 0;
 }
 
-static inline void randbuf_fill(randbuf *rb, aes128ctr_ctx *state) {
-  aes128ctr_squeezeblocks(rb->buf, 1, state);
+static void randbuf_free(randbuf *rb) {
+  if(rb->nnext)
+    aes128ctr_squeezeblocks_finish(&rb->h);  // workers may still write big[]
+  free(rb->big[0]);
+}
+
+static size_t randbuf_batch(randbuf *rb) {
+  size_t n = rb->left < RB_BATCH ? rb->left : RB_BATCH;
+  if(n < RB_MIN) n = RB_MIN;
+  rb->left -= rb->left < n ? rb->left : n;
+  return n;
+}
+
+static void randbuf_fill(randbuf *rb, aes128ctr_ctx *state) {
+  size_t n;
+
+  if(rb->buf == NULL || ++rb->blk >= rb->nblk) {
+    if(rb->nnext) {
+      aes128ctr_squeezeblocks_finish(&rb->h);
+      rb->cur ^= 1;
+      rb->nblk = rb->nnext;
+      rb->nnext = 0;
+    }
+    else {
+      n = randbuf_batch(rb);
+      aes128ctr_squeezeblocks(rb->big[rb->cur], n, state);
+      rb->nblk = n;
+    }
+    rb->blk = 0;
+    if(rb->left) {  // generate the next batch while this one is consumed
+      n = randbuf_batch(rb);
+      aes128ctr_squeezeblocks_start(&rb->h, rb->big[rb->cur^1], n, state);
+      rb->nnext = n;
+    }
+  }
+  rb->buf = &rb->big[rb->cur][rb->blk * AES128CTR_BLOCKBYTES];
   rb->pos = 0;
 }
 
@@ -183,7 +243,9 @@ gaussian_i32 (int32_t *ret, unsigned int nelems, aes128ctr_ctx *state,
 
   aes128ctr_squeezeblocks(out, nblocks, state);
 
-  randbuf_init(&rb);
+  // measured consumption is ~40.6 bytes per sample (trials of 32.1 bytes
+  // plus block-boundary waste); the estimate only affects batch sizes
+  randbuf_init(&rb, (size_t)nelems*41/AES128CTR_BLOCKBYTES + 2);
 
   for (i = 0; i < nelems; i++)
     {
@@ -198,5 +260,6 @@ gaussian_i32 (int32_t *ret, unsigned int nelems, aes128ctr_ctx *state,
       ret[i] = ((int32_t)k << log2sd) - urand;
     }
 
+    randbuf_free(&rb);
     free (out);
 }

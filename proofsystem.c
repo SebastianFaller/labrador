@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <inttypes.h>
 #include "proofsystem.h"
+#include "parallel.h"
 #include "polx.h"
 #include "malloc.h"
 #include "randombytes.h"
@@ -487,14 +488,17 @@ void ps_addcheck_commit_outer(
   polxvec_setzero(c->b, 0, 1, 1);
 }
 
-void ps_addcheck_commit_coeffs(
-  sparsecnst *c,
-  polz outcom,
-  size_t wpos,
-  size_t base_unif,
-  size_t digits_unif
-)
-{
+typedef struct {
+  sparsecnst *c;
+  const struct polz_str *outcom;
+  size_t wpos, base_unif, digits_unif;
+} commit_coeffs_job;
+
+/* constraints [begin,end); every constraint i only depends on i and the
+   inputs, phi64 is private scratch that is all-zero between iterations */
+static void commit_coeffs_range(void *arg, size_t begin, size_t end) {
+  const commit_coeffs_job *job = arg;
+  sparsecnst *c = job->c;
   size_t i, j, idx;
   size_t stride = N / SIS1_NCOEF;
   zz coeff;
@@ -504,26 +508,39 @@ void ps_addcheck_commit_coeffs(
 
   memset(phi64, 0, sizeof(phi64));
 
-  for(i=0;i<SIS1_NCOEF;i++){
+  for(i=begin;i<end;i++){
     sparsecnst_init(c[i], 1);
     linfunc_init(c[i]->lin, 1, 1, 1);
-    c[i]->lin->off[0] = wpos;
-    polxvec_init(c[i]->lin->phi[0], digits_unif, 1);
+    c[i]->lin->off[0] = job->wpos;
+    polxvec_init(c[i]->lin->phi[0], job->digits_unif, 1);
     
     idx = (i==0) ? 0 : N - stride*i;
     phi64[idx] = (i==0) ? 1 : -1;
-    for(j=0;j<digits_unif;j++){ 
+    for(j=0;j<job->digits_unif;j++){ 
       polxvec_init_subvec2(phi, c[i]->lin->phi[0], j, 1, 1);
       polxvec_fromint64vec2(phi, phi64, 1, 1, 1);
-      phi64[idx] *= 1 << base_unif;
+      phi64[idx] *= 1 << job->base_unif;
     }
     phi64[idx] = 0;
 
-    polz_getcoeff(coeff, outcom, stride*i);
+    polz_getcoeff(coeff, job->outcom, stride*i);
     polzvec_setzero(&b, 1);
     polz_setcoeff(b, coeff, 0);
     polzvec_topolxvec(c[i]->b, &b, 0, 1, 1);
   }
+}
+
+void ps_addcheck_commit_coeffs(
+  sparsecnst *c,
+  polz outcom,
+  size_t wpos,
+  size_t base_unif,
+  size_t digits_unif
+)
+{
+  commit_coeffs_job job = { c, outcom, wpos, base_unif, digits_unif };
+
+  lab_parallel_for(SIS1_NCOEF, 4, commit_coeffs_range, &job);
 }
 
 void ps_addcheck_lift_zero_coeff(sparsecnst c[LIFTS], size_t liftpos){

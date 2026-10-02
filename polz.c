@@ -9,6 +9,7 @@
 #include "polx.h"
 #include "poly.h"
 #include "polz.h"
+#include "parallel.h"
 #include "malloc.h"
 #include "gaussian.h"
 
@@ -613,7 +614,7 @@ void polz_topolx(polx r, const polz a) {
   polx_ntt(r,r);
 }
 
-void polzvec_topolxvec(polxvec r, const polz *a, size_t off, ssize_t stride, size_t len) {
+static void polzvec_topolxvec_ser(polxvec r, const polz *a, size_t off, ssize_t stride, size_t len) {
   size_t i,j,k;
 
   assert(off < r->len);
@@ -949,13 +950,55 @@ static void frompolxvec(polz *r, const polxvec a, size_t off, ssize_t stride, si
   polzvec_reduce(r,len);
 }
 
-void polzvec_frompolxvec(polz *r, const polxvec a, size_t off, ssize_t stride, size_t len) {
+static void polzvec_frompolxvec_ser(polz *r, const polxvec a, size_t off, ssize_t stride, size_t len) {
   size_t j,k;
 
   assert(off < a->len);
   assert(off+stride*(len-1) < a->len);
   for(j=0;(k=MIN(32,len-j));j+=k)
     frompolxvec(&r[j],a,off+j*stride,stride,k);
+}
+
+/* Multi-threaded conversions (see parallel.h): elements are independent, each
+   range is converted by the unchanged serial code. */
+#define PZ_MIN 16
+#define PZ_GRAIN 8
+
+typedef struct {
+  polxvec_ptr x;
+  polz *z;
+  size_t off;
+  ssize_t stride;
+} pz_job;
+
+static void pz_topolxvec_range(void *arg, size_t begin, size_t end) {
+  const pz_job *j = arg;
+  polzvec_topolxvec_ser(j->x,&j->z[begin],j->off+begin*j->stride,j->stride,end-begin);
+}
+
+void polzvec_topolxvec(polxvec r, const polz *a, size_t off, ssize_t stride, size_t len) {
+  pz_job job = { r, (polz *)a, off, stride };
+
+  if(len < PZ_MIN) {
+    polzvec_topolxvec_ser(r,a,off,stride,len);
+    return;
+  }
+  lab_parallel_for(len,PZ_GRAIN,pz_topolxvec_range,&job);
+}
+
+static void pz_frompolxvec_range(void *arg, size_t begin, size_t end) {
+  const pz_job *j = arg;
+  polzvec_frompolxvec_ser(&j->z[begin],j->x,j->off+begin*j->stride,j->stride,end-begin);
+}
+
+void polzvec_frompolxvec(polz *r, const polxvec a, size_t off, ssize_t stride, size_t len) {
+  pz_job job = { (polxvec_ptr)a, r, off, stride };
+
+  if(len < PZ_MIN) {
+    polzvec_frompolxvec_ser(r,a,off,stride,len);
+    return;
+  }
+  lab_parallel_for(len,PZ_GRAIN,pz_frompolxvec_range,&job);
 }
 
 void polz_add(polz r, const polz a, const polz b) {

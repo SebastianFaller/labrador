@@ -7,6 +7,8 @@
 #include "polx.h"
 #include "poly.h"
 #include "polz.h"
+#define LAB_PARALLEL_IMPL
+#include "parallel.h"
 
 static int64_t cmodq(int64_t a) {
   int64_t t;
@@ -316,7 +318,7 @@ void polx_frompoly(polx r, const poly a, double width) {
   polx_ntt(r,r);
 }
 
-void polxvec_frompolyvec(polxvec r, const poly *a, ssize_t stride, size_t len, double width) {
+static void polxvec_frompolyvec_ser(polxvec r, const poly *a, ssize_t stride, size_t len, double width) {
   size_t i,j,k;
 
   assert(r->len >= len);
@@ -351,20 +353,39 @@ void polx_almostuniform(polx r, const uint8_t seed[16], uint64_t nonce) {
   }
 }
 
-void polxvec_almostuniform(polxvec r, const uint8_t seed[16], uint64_t nonce) {
-  size_t i,j,k;
+typedef struct {
+  polxvec_ptr r;
+  const uint8_t *seed;
+  uint64_t nonce;
+} almostuniform_job;
+
+/* 32-element chunk c uses the independent PRG stream (seed, nonce + c*2^32),
+   so chunks can be generated in any order / concurrently */
+static void almostuniform_chunks(void *arg, size_t begin, size_t end) {
+  const almostuniform_job *job = arg;
+  polxvec_ptr r = job->r;
+  size_t i,j,k,c;
+  uint64_t nonce;
   polz t[32];
 
-  polxvec_setwidths1(r,0,1,r->len,ldexp(1,2*LOGQ)/12.0);
-  for(j=0;(k=MIN(32,r->len-j));j+=k) {
-    polzvec_almostuniform(t,k,seed,nonce);
+  for(c=begin;c<end;c++) {
+    j = 32*c;
+    k = MIN(32,r->len-j);
+    nonce = job->nonce + ((uint64_t)c << 32);
+    polzvec_almostuniform(t,k,job->seed,nonce);
     polzvec_center(t,k);  // FIXME: Performance?
-    nonce += (uint64_t)1 << 32;
     for(i=0;i<K;i++) {
       polzvec_topolyvec_montgomery(&r->proj[i][j*r->stride],t,r->stride,k,primes[i]);
       polyvec_ntt(&r->proj[i][j*r->stride],&r->proj[i][j*r->stride],r->stride,r->stride,k,primes[i]);
     }
   }
+}
+
+void polxvec_almostuniform(polxvec r, const uint8_t seed[16], uint64_t nonce) {
+  almostuniform_job job = { r, seed, nonce };
+
+  polxvec_setwidths1(r,0,1,r->len,ldexp(1,2*LOGQ)/12.0);
+  lab_parallel_for((r->len+31)/32,1,almostuniform_chunks,&job);
 }
 
 void polx_ternary(polx r, const uint8_t seed[16], uint64_t nonce) {
@@ -405,15 +426,21 @@ void polx_refresh(polx r) {
   polz_topolx(r,t);
 }
 
-void polxvec_refresh(polxvec r) {
+static void polxvec_refresh_range(void *arg, size_t begin, size_t end) {
+  polxvec_ptr r = arg;
   size_t j,k;
   polz t[32];
 
-  for(j=0;(k=MIN(32,r->len-j));j+=k) {
+  for(j=begin;(k=MIN(32,end-j));j+=k) {
     polzvec_frompolxvec(t,r,j,1,k);
     polzvec_center(t,k);
     polzvec_topolxvec(r,t,j,1,k);
   }
+}
+
+void polxvec_refresh(polxvec r) {
+  /* elements are independent; widths are set per element */
+  lab_parallel_for(r->len,4,polxvec_refresh_range,r);
 }
 
 void polx_reduce(polx r) {
@@ -457,7 +484,7 @@ void polx_add(polx r, const polx a, const polx b) {
   polx_reduce(r);
 }
 
-void polxvec_add(polxvec r, const polxvec a, const polxvec b) {
+static void polxvec_add_ser(polxvec r, const polxvec a, const polxvec b) {
   size_t i,j,k;
 
   assert(r->len == a->len && a->len == b->len);
@@ -487,7 +514,7 @@ void polx_sub(polx r, const polx a, const polx b) {
   polx_reduce(r);
 }
 
-void polxvec_sub(polxvec r, const polxvec a, const polxvec b) {
+static void polxvec_sub_ser(polxvec r, const polxvec a, const polxvec b) {
   size_t i,j,k;
 
   assert(r->len == a->len && a->len == b->len);
@@ -514,7 +541,7 @@ void polx_ntt(polx r, const polx a) {
     poly_ntt(r->proj[i],a->proj[i],primes[i]);
 }
 
-void polxvec_ntt(polxvec r, const polxvec a) {
+static void polxvec_ntt_ser(polxvec r, const polxvec a) {
   size_t i;
 
   assert(r->len == a->len);
@@ -529,7 +556,7 @@ void polx_invntt(polx r, const polx a) {
     poly_invntt(r->proj[i],a->proj[i],primes[i]);
 }
 
-void polxvec_invntt(polxvec r, const polxvec a) {
+static void polxvec_invntt_ser(polxvec r, const polxvec a) {
   size_t i;
 
   assert(r->len == a->len);
@@ -581,7 +608,7 @@ void polx_poly_mul(polx r, const polx a, const poly b, double width) {
   polx_mul(r,a,t);
 }
 
-void polxvec_mul(polxvec r, const polxvec a, const polxvec b) {
+static void polxvec_mul_ser(polxvec r, const polxvec a, const polxvec b) {
   size_t i;
 
   if(a->len == 1) {
@@ -627,7 +654,7 @@ void polx_mul_add(polx r, const polx a, const polx b) {
   polx_reduce(r);
 }
 
-void polxvec_mul_add(polxvec r, const polxvec a, const polxvec b) {
+static void polxvec_mul_add_ser(polxvec r, const polxvec a, const polxvec b) {
   size_t i,j,k;
 
   if(a->len == 1) {
@@ -673,6 +700,89 @@ void polxvec_polx_mul_add(polxvec r, polx a, const polxvec b) {
   polxvec_mul_add(r,aa,b);
 }
 
+/* Split over the K CRT primes (all K inner products / extension products are
+   independent; each one is computed by the unchanged per-prime code). */
+#define PX_PRIME_MIN 64  /* minimum vector length (poly products per prime) */
+
+typedef struct {
+  polxvec_ptr r;
+  const struct polxvec_str *a, *b;
+  size_t deg;
+  size_t off;  /* offset into b (collaps_add_extension only) */
+} px_kjob;
+
+typedef struct {
+  polxvec_ptr g;
+  const struct polxvec_str *a, *b;
+  size_t r, n;
+} px_pjob;
+
+static void px_primes(lab_par_fn fn, polxvec_ptr r, const struct polxvec_str *a, const struct polxvec_str *b,
+                      size_t work, size_t deg, size_t off) {
+  px_kjob job = { r, a, b, deg, off };
+
+  if(work >= PX_PRIME_MIN)
+    lab_parallel_for(K,1,fn,&job);
+  else
+    fn(&job,0,K);
+}
+
+static void px_sprod_primes(void *arg, size_t begin, size_t end) {
+  const px_kjob *j = arg;
+  size_t i;
+  for(i=begin;i<end;i++)
+    polyvec_sprod_pointwise(*j->r->proj[i],j->a->proj[i],j->b->proj[i],j->a->stride,j->b->stride,j->a->len,primes[i]);
+}
+
+static void px_sprod_add_primes(void *arg, size_t begin, size_t end) {
+  const px_kjob *j = arg;
+  size_t i;
+  for(i=begin;i<end;i++)
+    polyvec_sprod_pointwise_add(*j->r->proj[i],j->a->proj[i],j->b->proj[i],j->a->stride,j->b->stride,j->a->len,primes[i]);
+}
+
+static void px_sprod_ext_primes(void *arg, size_t begin, size_t end) {
+  const px_kjob *j = arg;
+  polxvec_ptr c = j->r;
+  const struct polxvec_str *a = j->a, *b = j->b;
+  size_t i;
+  for(i=begin;i<end;i++)
+    polyvec_sprod_extension(c->proj[i],a->proj[i],b->proj[i],
+                            c->stride,a->stride,b->stride,j->deg,c->len,b->len,primes[i]);
+}
+
+static void px_sprod_ext_add_primes(void *arg, size_t begin, size_t end) {
+  const px_kjob *j = arg;
+  polxvec_ptr c = j->r;
+  const struct polxvec_str *a = j->a, *b = j->b;
+  const size_t off_a = 0;
+  poly tmp[c->len];
+  size_t i;
+  for(i=begin;i<end;i++) {
+    polyvec_sprod_extension(tmp,&a->proj[i][off_a*a->stride],b->proj[i],
+                            1,a->stride,b->stride,j->deg,c->len,b->len,primes[i]);
+    polyvec_add(c->proj[i],c->proj[i],tmp,c->stride,c->stride,1,c->len);  // TODO: better rely on interleave_reduce_add in sprod_extension
+    polyvec_reduce(c->proj[i],c->stride,c->len,primes[i]);
+  }
+}
+
+/* here r = c, a = b (the collapsed vector), b = &a[off_a] */
+static void px_collaps_primes(void *arg, size_t begin, size_t end) {
+  const px_kjob *j = arg;
+  polxvec_ptr c = j->r;
+  size_t i;
+  for(i=begin;i<end;i++)
+    polyvec_collaps_add_extension(c->proj[i],j->a->proj[i],&j->b->proj[i][j->off*j->b->stride],
+                                  c->stride,j->a->stride,j->b->stride,j->deg,c->len,j->a->len,primes[i]);
+}
+
+static void px_pairwise_sprod_primes(void *arg, size_t begin, size_t end) {
+  const px_pjob *j = arg;
+  size_t i;
+  for(i=begin;i<end;i++)
+    polyvec_pairwise_sprod(j->g->proj[i],j->a->proj[i],j->b->proj[i],j->r,j->n,primes[i]);
+}
+
 void polxvec_sprod(polxvec r, const polxvec a, const polxvec b) {
   size_t i;
 
@@ -689,8 +799,7 @@ void polxvec_sprod(polxvec r, const polxvec a, const polxvec b) {
       *r->widths += N*a->widths[i*a->stride]*b->widths[i*b->stride];
     assert(*r->widths <= MAXWIDTH);
   }
-  for(i=0;i<K;i++)
-    polyvec_sprod_pointwise(*r->proj[i],a->proj[i],b->proj[i],a->stride,b->stride,a->len,primes[i]);
+  px_primes(px_sprod_primes,r,a,b,a->len,0,0);
 }
 
 void polxvec_sprod_add(polxvec r, const polxvec a, const polxvec b) {
@@ -704,8 +813,7 @@ void polxvec_sprod_add(polxvec r, const polxvec a, const polxvec b) {
       *r->widths += N*a->widths[i*a->stride]*b->widths[i*b->stride];
     assert(*r->widths <= MAXWIDTH);
   }
-  for(i=0;i<K;i++)
-    polyvec_sprod_pointwise_add(*r->proj[i],a->proj[i],b->proj[i],a->stride,b->stride,a->len,primes[i]);
+  px_primes(px_sprod_add_primes,r,a,b,a->len,0,0);
   polxvec_reduce(r);
 }
 
@@ -731,7 +839,7 @@ void polx_scale_frompoly(polx r, const poly a, double width, int64_t s) {
   polx_ntt(r,r);
 }
 
-void polxvec_scale(polxvec r, const polxvec a, int64_t s) {
+static void polxvec_scale_ser(polxvec r, const polxvec a, int64_t s) {
   size_t i;
 
   s = cmodq(s);
@@ -748,7 +856,7 @@ void polxvec_scale(polxvec r, const polxvec a, int64_t s) {
     polyvec_scale(r->proj[i],a->proj[i],r->stride,a->stride,r->len,modp(s,primes[i]),primes[i]);
 }
 
-void polxvec_scale_frompolyvec(polxvec r, const poly *a, ssize_t stride, size_t len, double width, int64_t s) {
+static void polxvec_scale_frompolyvec_ser(polxvec r, const poly *a, ssize_t stride, size_t len, double width, int64_t s) {
   size_t i,j,k;
   int16_t sp[K];
 
@@ -777,7 +885,7 @@ void polx_scale_add(polx r, const polx a, int64_t s) {
   polx_reduce(r);
 }
 
-void polxvec_scale_add(polxvec r, const polxvec a, int64_t s) {
+static void polxvec_scale_add_ser(polxvec r, const polxvec a, int64_t s) {
   size_t i,j,k;
   int16_t sp[K];
 
@@ -806,7 +914,7 @@ static size_t polxvec_sprod_extension_internal(polxvec c, const polxvec a, const
   size_t deg;
   size_t off_a = 0;
   double width_a,width_b,width_c;
-  poly tmp[c->len];
+  int tmp = 0;
 
   deg = next2power(c->len);
   k  = extlen(b->len,deg);
@@ -835,17 +943,8 @@ static size_t polxvec_sprod_extension_internal(polxvec c, const polxvec a, const
       }
     }
   }
-  for(i=0;i<K;i++) {
-    if(!add)
-      polyvec_sprod_extension(c->proj[i],a->proj[i],b->proj[i],
-                              c->stride,a->stride,b->stride,deg,c->len,b->len,primes[i]);
-    else {
-      polyvec_sprod_extension(tmp,&a->proj[i][off_a*a->stride],b->proj[i],
-                              1,a->stride,b->stride,deg,c->len,b->len,primes[i]);
-      polyvec_add(c->proj[i],c->proj[i],tmp,c->stride,c->stride,1,c->len);  // TODO: better rely on interleave_reduce_add in sprod_extension
-      polyvec_reduce(c->proj[i],c->stride,c->len,primes[i]);
-    }
-  }
+  (void)tmp;
+  px_primes(add ? px_sprod_ext_add_primes : px_sprod_ext_primes,c,a,b,b->len,deg,0);
   return k;
 }
 
@@ -881,9 +980,7 @@ size_t polxvec_collaps_add_extension(polxvec c, const polxvec b, const polxvec a
       }
     }
   }
-  for(i=0;i<K;i++)
-    polyvec_collaps_add_extension(c->proj[i],b->proj[i],&a->proj[i][off_a*a->stride],
-                                  c->stride,b->stride,a->stride,deg,c->len,b->len,primes[i]);
+  px_primes(px_collaps_primes,c,b,a,b->len*c->len/deg+1,deg,off_a);
   return k;
 }
 
@@ -916,8 +1013,13 @@ size_t polxvec_pairwise_sprod(polxvec g, const polxvec a, const polxvec b, size_
       assert(g->widths[i*g->stride] <= MAXWIDTH);
     }
   }
-  for(i=0;i<K;i++)
-    polyvec_pairwise_sprod(g->proj[i],a->proj[i],b->proj[i],r,n,primes[i]);
+  {
+    px_pjob job = { g, a, b, r, n };
+    if(r*r*n/2 >= PX_PRIME_MIN)
+      lab_parallel_for(K,1,px_pairwise_sprod_primes,&job);
+    else
+      px_pairwise_sprod_primes(&job,0,K);
+  }
   return m;
 }
 
@@ -929,7 +1031,7 @@ void polx_bindec(poly *r, const polx a, ssize_t stride, size_t t) {
   polz_bindec(r,b,stride,t);
 }
 
-void polxvec_bindec(poly *r, const polxvec a, ssize_t stride, size_t t) {
+static void polxvec_bindec_ser(poly *r, const polxvec a, ssize_t stride, size_t t) {
   size_t j,k;
   polz b[32];
 
@@ -949,7 +1051,7 @@ void polx_decompose(poly *r, const polx a, ssize_t stride, size_t t, size_t d) {
   polz_decompose(r,b,stride,t,d);
 }
 
-void polxvec_decompose(poly *r, const polxvec a, ssize_t stride, size_t t, size_t d) {
+static void polxvec_decompose_ser(poly *r, const polxvec a, ssize_t stride, size_t t, size_t d) {
   size_t j,k;
   polz b[32];
 
@@ -968,7 +1070,7 @@ void polx_reconstruct(polx r, const poly *a, ssize_t stride, size_t t, size_t d)
   polz_topolx(r,b);
 }
 
-void polxvec_reconstruct(polxvec r, const poly *a, ssize_t stride, size_t t, size_t d) {
+static void polxvec_reconstruct_ser(polxvec r, const poly *a, ssize_t stride, size_t t, size_t d) {
   size_t j,k;
   polz b[32];
 
@@ -987,7 +1089,7 @@ void polx_sigmam1(polx r, const polx a) {
     poly_sigmam1_ntt(r->proj[i],a->proj[i]);
 }
 
-void polxvec_sigmam1(polxvec r, const polxvec a) {
+static void polxvec_sigmam1_ser(polxvec r, const polxvec a) {
   size_t i;
 
   assert(r->len == a->len);
@@ -1039,7 +1141,7 @@ void polx_flip(polx r, const polx a) {
     poly_flip_ntt(r->proj[i],a->proj[i],primes[i]);
 }
 
-void polxvec_flip(polxvec r, const polxvec a) {
+static void polxvec_flip_ser(polxvec r, const polxvec a) {
   size_t i;
 
   assert(r->len == a->len);
@@ -1050,4 +1152,281 @@ void polxvec_flip(polxvec r, const polxvec a) {
   }
   for(i=0;i<K;i++)
     polyvec_flip_ntt(r->proj[i],a->proj[i],r->stride,a->stride,r->len,primes[i]);
+}
+
+/*
+ * Multi-threading (see parallel.h).  Vector functions below are split into
+ * contiguous element ranges (each range is processed by the unchanged serial
+ * code on a sub-vector view) or, for inner products, into ranges of CRT
+ * primes.  Every output element / prime is computed by exactly the same
+ * instruction sequence as in the serial code, so results are bit-identical.
+ * Element splitting requires that the output does not partially overlap an
+ * input (identical views and disjoint memory are fine); otherwise the serial
+ * code runs.  Floating point width bookkeeping is never reordered.
+ */
+#define PX_MIN_NTT 16    /* vector length from which NTT-heavy ops are split */
+#define PX_MIN_CHEAP 128 /* ... cheap pointwise ops */
+#define PX_GRAIN 8
+
+typedef void (*px_f3)(polxvec_ptr, const struct polxvec_str *, const struct polxvec_str *);
+typedef void (*px_f2s)(polxvec_ptr, const struct polxvec_str *, int64_t);
+
+typedef struct {
+  px_f3 f3;
+  px_f2s f2s;
+  polxvec_ptr r;
+  const struct polxvec_str *a, *b;
+  int64_t s;
+  /* poly-array based conversions */
+  poly *pr;
+  const poly *pa;
+  ssize_t stride;
+  size_t t, d;
+  double width;
+  const int64_t *ia;
+  size_t deg;
+  uint8_t seed[16];
+  uint64_t nonce;
+} px_job;
+
+/* memory span of prime i of v, in bytes */
+static void px_span(const struct polxvec_str *v, size_t i, uintptr_t *lo, uintptr_t *hi) {
+  uintptr_t p0 = (uintptr_t)v->proj[i];
+  uintptr_t p1 = (uintptr_t)&v->proj[i][v->stride*(ssize_t)(v->len-1)];
+  *lo = p0 < p1 ? p0 : p1;
+  *hi = (p0 < p1 ? p1 : p0) + sizeof(poly);
+}
+
+/* r and a are the same view or do not overlap */
+static int px_nooverlap(const struct polxvec_str *r, const struct polxvec_str *a) {
+  size_t i;
+  uintptr_t rl, rh, al, ah;
+
+  if(a == NULL || a->len == 0)
+    return 1;
+  if(r->proj[0] == a->proj[0] && r->stride == a->stride && r->len == a->len)
+    return 1;
+  for(i=0;i<K;i++) {
+    px_span(r,i,&rl,&rh);
+    px_span(a,i,&al,&ah);
+    if(rl < ah && al < rh)
+      return 0;
+  }
+  return 1;
+}
+
+static int px_split(const struct polxvec_str *r, const struct polxvec_str *a, const struct polxvec_str *b, size_t minlen) {
+  return r->len >= minlen && r->alloc && lab_parallel_nthreads() > 1
+         && px_nooverlap(r,a) && px_nooverlap(r,b);
+}
+
+/* the poly array a[j + i*stride] (j < n, i < t; for t == 1 stride is the element
+   stride) does not overlap v, or (t == 1) it is one of v's own CRT planes with
+   v's stride, i.e. element j only aliases element j */
+static int px_arr_ok(const struct polxvec_str *v, const poly *a, ssize_t stride, size_t n, size_t t) {
+  size_t i;
+  uintptr_t vl, vh, al, ah, p0, p1;
+
+  if(t == 1) {
+    for(i=0;i<K;i++)
+      if(a == v->proj[i] && stride == v->stride)
+        return 1;
+    p0 = (uintptr_t)a;
+    p1 = (uintptr_t)&a[stride*(ssize_t)(n-1)];
+  }
+  else {
+    if(stride < (ssize_t)n)
+      return 0;
+    p0 = (uintptr_t)a;
+    p1 = (uintptr_t)&a[stride*(ssize_t)(t-1) + (ssize_t)n - 1];
+  }
+  al = p0 < p1 ? p0 : p1;
+  ah = (p0 < p1 ? p1 : p0) + sizeof(poly);
+  for(i=0;i<K;i++) {
+    px_span(v,i,&vl,&vh);
+    if(vl < ah && al < vh)
+      return 0;
+  }
+  return 1;
+}
+
+static void px_sub(polxvec v, const struct polxvec_str *a, size_t begin, size_t end) {
+  if(a->len == 1)  /* broadcast operand */
+    *v = *a;
+  else
+    polxvec_init_subvec2(v,a,begin,1,end-begin);
+}
+
+static void px_range3(void *arg, size_t begin, size_t end) {
+  const px_job *job = arg;
+  polxvec rs, as, bs;
+
+  polxvec_init_subvec2(rs,job->r,begin,1,end-begin);
+  px_sub(as,job->a,begin,end);
+  if(job->b) {
+    px_sub(bs,job->b,begin,end);
+    job->f3(rs,as,bs);
+  }
+  else
+    job->f3(rs,as,NULL);
+}
+
+static void px_range2s(void *arg, size_t begin, size_t end) {
+  const px_job *job = arg;
+  polxvec rs, as;
+
+  polxvec_init_subvec2(rs,job->r,begin,1,end-begin);
+  px_sub(as,job->a,begin,end);
+  job->f2s(rs,as,job->s);
+}
+
+static void px_run3(px_f3 f, polxvec_ptr r, const struct polxvec_str *a, const struct polxvec_str *b, size_t minlen) {
+  px_job job;
+
+  if(!px_split(r,a,b,minlen)) {
+    f(r,a,b);
+    return;
+  }
+  job.f3 = f; job.r = r; job.a = a; job.b = b;
+  lab_parallel_for(r->len,PX_GRAIN,px_range3,&job);
+}
+
+static void px_run2s(px_f2s f, polxvec_ptr r, const struct polxvec_str *a, int64_t s, size_t minlen) {
+  px_job job;
+
+  if(!px_split(r,a,NULL,minlen)) {
+    f(r,a,s);
+    return;
+  }
+  job.f2s = f; job.r = r; job.a = a; job.s = s;
+  lab_parallel_for(r->len,PX_GRAIN,px_range2s,&job);
+}
+
+static void polxvec_ntt_ser2(polxvec_ptr r, const struct polxvec_str *a, const struct polxvec_str *b) { (void)b; polxvec_ntt_ser(r,a); }
+static void polxvec_invntt_ser2(polxvec_ptr r, const struct polxvec_str *a, const struct polxvec_str *b) { (void)b; polxvec_invntt_ser(r,a); }
+static void polxvec_sigmam1_ser2(polxvec_ptr r, const struct polxvec_str *a, const struct polxvec_str *b) { (void)b; polxvec_sigmam1_ser(r,a); }
+static void polxvec_flip_ser2(polxvec_ptr r, const struct polxvec_str *a, const struct polxvec_str *b) { (void)b; polxvec_flip_ser(r,a); }
+
+void polxvec_add(polxvec r, const polxvec a, const polxvec b) { px_run3(polxvec_add_ser,r,a,b,PX_MIN_CHEAP); }
+void polxvec_sub(polxvec r, const polxvec a, const polxvec b) { px_run3(polxvec_sub_ser,r,a,b,PX_MIN_CHEAP); }
+void polxvec_ntt(polxvec r, const polxvec a) { px_run3(polxvec_ntt_ser2,r,a,NULL,PX_MIN_NTT); }
+void polxvec_invntt(polxvec r, const polxvec a) { px_run3(polxvec_invntt_ser2,r,a,NULL,PX_MIN_NTT); }
+void polxvec_sigmam1(polxvec r, const polxvec a) { px_run3(polxvec_sigmam1_ser2,r,a,NULL,PX_MIN_CHEAP); }
+void polxvec_flip(polxvec r, const polxvec a) { px_run3(polxvec_flip_ser2,r,a,NULL,PX_MIN_CHEAP); }
+void polxvec_scale(polxvec r, const polxvec a, int64_t s) { px_run2s(polxvec_scale_ser,r,a,s,PX_MIN_CHEAP); }
+void polxvec_scale_add(polxvec r, const polxvec a, int64_t s) { px_run2s(polxvec_scale_add_ser,r,a,s,PX_MIN_CHEAP); }
+
+void polxvec_mul(polxvec r, const polxvec a, const polxvec b) {
+  /* a may be a broadcast scalar (len 1); split r and b */
+  if(a->len == 1 && b->len > 1) px_run3(polxvec_mul_ser,r,a,b,PX_MIN_CHEAP/2);
+  else if(a->len > 1) px_run3(polxvec_mul_ser,r,a,b,PX_MIN_CHEAP/2);
+  else polxvec_mul_ser(r,a,b);
+}
+
+void polxvec_mul_add(polxvec r, const polxvec a, const polxvec b) {
+  if(a->len == 1 && b->len > 1) px_run3(polxvec_mul_add_ser,r,a,b,PX_MIN_CHEAP/2);
+  else if(a->len > 1) px_run3(polxvec_mul_add_ser,r,a,b,PX_MIN_CHEAP/2);
+  else polxvec_mul_add_ser(r,a,b);
+}
+
+/* conversions from poly arrays: r[j] <- a[j*stride], disjoint by construction
+   (a is a plain poly array, r a polxvec; the in-place use
+   polxvec_frompolyvec(r,r->proj[K-1],...) reads proj[K-1][j] before writing
+   any proj[i][j] of the same element, and elements are independent) */
+static void px_range_frompolyvec(void *arg, size_t begin, size_t end) {
+  const px_job *job = arg;
+  polxvec rs;
+
+  polxvec_init_subvec2(rs,job->r,begin,1,end-begin);
+  polxvec_frompolyvec_ser(rs,&job->pa[job->stride*(ssize_t)begin],job->stride,end-begin,job->width);
+}
+
+void polxvec_frompolyvec(polxvec r, const poly *a, ssize_t stride, size_t len, double width) {
+  px_job job;
+
+  if(len < PX_MIN_NTT || !r->alloc || lab_parallel_nthreads() < 2 || !px_arr_ok(r,a,stride,len,1)) {
+    polxvec_frompolyvec_ser(r,a,stride,len,width);
+    return;
+  }
+  assert(r->len >= len);
+  job.r = r; job.pa = a; job.stride = stride; job.width = width;
+  lab_parallel_for(len,PX_GRAIN,px_range_frompolyvec,&job);
+}
+
+static void px_range_scale_frompolyvec(void *arg, size_t begin, size_t end) {
+  const px_job *job = arg;
+  polxvec rs;
+
+  polxvec_init_subvec2(rs,job->r,begin,1,end-begin);
+  polxvec_scale_frompolyvec_ser(rs,&job->pa[job->stride*(ssize_t)begin],job->stride,end-begin,job->width,job->s);
+}
+
+void polxvec_scale_frompolyvec(polxvec r, const poly *a, ssize_t stride, size_t len, double width, int64_t s) {
+  px_job job;
+
+  if(len < PX_MIN_NTT || !r->alloc || lab_parallel_nthreads() < 2 || !px_arr_ok(r,a,stride,len,1)) {
+    polxvec_scale_frompolyvec_ser(r,a,stride,len,width,s);
+    return;
+  }
+  assert(r->len == len);
+  job.r = r; job.pa = a; job.stride = stride; job.width = width; job.s = s;
+  lab_parallel_for(len,PX_GRAIN,px_range_scale_frompolyvec,&job);
+}
+
+/* conversions to poly arrays: r[j + i*stride] for element j of a */
+static void px_range_bindec(void *arg, size_t begin, size_t end) {
+  const px_job *job = arg;
+  polxvec as;
+
+  polxvec_init_subvec2(as,job->a,begin,1,end-begin);
+  if(job->d)
+    polxvec_decompose_ser(&job->pr[begin],as,job->stride,job->t,job->d);
+  else
+    polxvec_bindec_ser(&job->pr[begin],as,job->stride,job->t);
+}
+
+void polxvec_bindec(poly *r, const polxvec a, ssize_t stride, size_t t) {
+  px_job job;
+
+  if(a->len < PX_MIN_NTT || !a->alloc || lab_parallel_nthreads() < 2 || t < 2 || !px_arr_ok(a,r,stride,a->len,t)) {
+    polxvec_bindec_ser(r,a,stride,t);
+    return;
+  }
+  job.pr = r; job.a = a; job.stride = stride; job.t = t; job.d = 0;
+  lab_parallel_for(a->len,PX_GRAIN,px_range_bindec,&job);
+}
+
+void polxvec_decompose(poly *r, const polxvec a, ssize_t stride, size_t t, size_t d) {
+  px_job job;
+
+  if(a->len < PX_MIN_NTT || !a->alloc || d == 0 || lab_parallel_nthreads() < 2 || t < 2 || !px_arr_ok(a,r,stride,a->len,t)) {
+    polxvec_decompose_ser(r,a,stride,t,d);
+    return;
+  }
+  job.pr = r; job.a = a; job.stride = stride; job.t = t; job.d = d;
+  lab_parallel_for(a->len,PX_GRAIN,px_range_bindec,&job);
+}
+
+static void px_range_reconstruct(void *arg, size_t begin, size_t end) {
+  const px_job *job = arg;
+  polxvec rs;
+
+  polxvec_init_subvec2(rs,job->r,begin,1,end-begin);
+  polxvec_reconstruct_ser(rs,&job->pa[begin],job->stride,job->t,job->d);
+}
+
+void polxvec_reconstruct(polxvec r, const poly *a, ssize_t stride, size_t t, size_t d) {
+  px_job job;
+
+  if(r->len < PX_MIN_NTT || !r->alloc || lab_parallel_nthreads() < 2 || t < 2 || !px_arr_ok(r,a,stride,r->len,t)) {
+    polxvec_reconstruct_ser(r,a,stride,t,d);
+    return;
+  }
+  job.r = r; job.pa = a; job.stride = stride; job.t = t; job.d = d;
+  lab_parallel_for(r->len,PX_GRAIN,px_range_reconstruct,&job);
+}
+
+/* exported for other files: r is the same view as a or does not overlap it */
+int polxvec_nooverlap(const polxvec r, const polxvec a) {
+  return px_nooverlap(r,a);
 }

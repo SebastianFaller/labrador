@@ -120,4 +120,6 @@ void polxvec_sigma5inv(polxvec r, const polxvec a);
 void polx_flip(polx r, const polx a);
 void polxvec_flip(polxvec r, const polxvec a);
 
+int polxvec_nooverlap(const polxvec r, const polxvec a);
+
 #endif
