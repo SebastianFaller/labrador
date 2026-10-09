@@ -41,6 +41,7 @@ static void ldd_collapse_jl(
     polxvec_init(phi_jlproj[i], jlbits_max * 256/N, 1);
 
     jl_aggregate_mat(jlmat_agg[i], jlmat1, jlmat2, chalz_jlmat);
+    polxvec_refresh(jlmat_agg[i]);
     jl_aggregate_proj(phi_jlproj[i], jlbits_max, chalz_jlmat);
   }
 }
