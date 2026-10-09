@@ -477,6 +477,7 @@ void comcnst_copy(comcnst out, const comcnst in){
   size_t i;
 
   comcnst_init(out, in->rank, in->ncom, in->nphi, in->nphi);
+  polxvec_copy(out->b, in->b);
   for(i=0;i<in->ncom;i++){
     out->comk_off[i] = in->comk_off[i];
     out->comw_off[i] = in->comw_off[i];
