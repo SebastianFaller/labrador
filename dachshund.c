@@ -666,6 +666,7 @@ int dch_params_gen(
     off += pp->nexact;
   }
 
+  pp->len_exact_total = 0;
   if(pp->nexact > 0 || pp->nquad > 0){
     pp->off_midcom = off;
     off += pp->kappa_middle * LOGQ;
