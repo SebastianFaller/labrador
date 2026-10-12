@@ -14,6 +14,7 @@ A core component is a re-implementation of the [LaBRADOR](https://eprint.iacr.or
 
 > [!NOTE]
 > This implementation can only be compiled for and run on CPUs that support the AVX-512 instruction set.
+> This branch also builds on aarch64 (e.g. Raspberry Pi 4), with bit-identical results; see [README-aarch64.md](README-aarch64.md).
 
 In order to run the aggregate signatures example whose results are reported in the paper:
 1. Compile the library for Falcon signatures:
