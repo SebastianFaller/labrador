@@ -1,7 +1,11 @@
 #include <stdint.h>
 #include <stdalign.h>
 #include <stdio.h>
+#if defined(__x86_64__) && !defined(LAZER_PORTABLE)
+#include <x86intrin.h>
+#else
 #include "simd.h"
+#endif
 #include "simd_neon.h"
 #include <math.h>
 #include <complex.h>

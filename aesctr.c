@@ -5,7 +5,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
+#if !defined(__x86_64__) || defined(LAZER_PORTABLE)
+#include <string.h>  /* portable AES path */
+#endif
 #include "simd.h"
 #include "simd_neon.h"
 #include "aesctr.h"
@@ -215,10 +217,12 @@ static inline void vaesni_encrypt8(uint8_t out[512], __m128i *n, const __m128i *
 
 #endif
 
+/* round keys passed to vaesni_encrypt8; always called with the identifier
+   "state", unparenthesized so that x86-64 preprocesses to upstream's code */
 #ifdef AESCTR_BSKEYS
-#define AESCTR_KEYS(state) ((state)->bsk)
+#define AESCTR_KEYS(state) state->bsk
 #else
-#define AESCTR_KEYS(state) ((state)->rkeys)
+#define AESCTR_KEYS(state) state->rkeys
 #endif
 
 void aes128ctr_init(aes128ctr_ctx *state, const uint8_t key[16], uint64_t nonce)
