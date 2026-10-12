@@ -12,12 +12,15 @@
  * that are bit-identical to the AVX-512 code for all inputs (all integer
  * arithmetic below wraps exactly like the corresponding AVX-512 instruction).
  *
- * Define LABRADOS_FORCE_AVX512 (or JL_FORCE_AVX512) to compile the original
- * AVX-512/SIMDe code paths instead (used by the equivalence tests).
+ * LABRADOS_NEON is the single switch for all aarch64-specific code in
+ * labrados (these NEON kernels, the NEON NTT in ntt.c, the JL table lookup in
+ * jlproj.c and the NEON AES in aesctr.c). It is never defined on x86-64.
+ * Define LABRADOS_FORCE_AVX512 to compile the original AVX-512 code (through
+ * SIMDe) on aarch64 as well; the equivalence tests in tests/aarch64 compare
+ * the two builds.
  */
 
-#if defined(__aarch64__) && !defined(LABRADOS_FORCE_AVX512) && !defined(JL_FORCE_AVX512) \
-    && !(defined(__x86_64__) && !defined(LAZER_PORTABLE))
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(LABRADOS_FORCE_AVX512)
 #define LABRADOS_NEON 1
 #include <arm_neon.h>
 

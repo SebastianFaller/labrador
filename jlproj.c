@@ -575,8 +575,8 @@ static void jlproj_collapsmat32(int64_t *row, const uint8_t *mat, size_t len, co
   r = _mm512_permutexvar_epi64(revidx,r);  // -+++,-++-,-+-+,-+--,--++,--+-,---+,----
 #endif
 
-#if !defined(JL_FORCE_AVX512) && !(defined(__x86_64__) && !defined(LAZER_PORTABLE))
-  /* Non-x86: SIMDe emulates _mm512_permutex2var_epi64 lane by lane, which made
+#ifdef LABRADOS_NEON
+  /* aarch64: SIMDe emulates _mm512_permutex2var_epi64 lane by lane, which made
    * this loop ~50% of all prover/verifier cycles. Each permutex2var is just a
    * 16-entry table lookup indexed by a 4-bit nibble of the (public) JL matrix,
    * so do exactly that in scalar code. Wrapping uint64 adds give results

@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "simd.h"
+#include "simd_neon.h"
 #include "aesctr.h"
 #include "parallel.h"
 
@@ -103,7 +104,7 @@ static inline void store64le(uint8_t *buf, uint64_t x) {
     buf[i] = (uint8_t)(x >> 8*i);
 }
 
-#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(LAZER_AES_NO_NEON)
+#ifdef LABRADOS_NEON
 
 /* aarch64: NEON bitsliced AES, 8 blocks in parallel (see ../aes-neonbs.h) */
 #include "../aes-neonbs.h"

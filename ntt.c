@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "simd.h"
+#include "simd_neon.h"
 #include "data.h"
 #include "poly.h"
 
@@ -29,8 +30,7 @@ static inline __m512i divmont(const __m512i a, const __m512i p, const __m512i pi
   return r;
 }
 
-#if !defined(NTT_FORCE_AVX512) && !(defined(__x86_64__) && !defined(LAZER_PORTABLE)) \
-    && defined(__aarch64__) && defined(__ARM_NEON) && N == 256
+#if defined(LABRADOS_NEON) && N == 256
 /*
  * Native NEON implementation of poly_ntt, poly_invntt and poly_nttunpack
  * (aarch64). Bit-identical to the AVX-512 code above for ALL int16 inputs:
