@@ -5,7 +5,8 @@
 #        code (through SIMDe) and serial loops, as without the aarch64 changes;
 #   opt: the aarch64 code (NEON kernels, NEON AES, JL table lookup, threads).
 # `make check` runs both and requires byte-identical outputs; the prover test
-# also runs opt with LAB_THREADS=1 and 4. `make bench` prints kernel timings.
+# also runs opt with LAB_THREADS=1 and 4. Outputs (up to ~430 MB per LOGQ) are
+# deleted once they compare equal and kept in build/ if they differ. `make bench` prints kernel timings.
 #
 # Run on aarch64, from lazer/src/labrados/tests/aarch64 (SIMDe is unpacked by
 # lazer's top-level make), or set SIMDE_DIR.
@@ -54,6 +55,7 @@ check: all
 	    build/$${t}_$${q}_opt build/$${t}_$${q}.opt; \
 	    cmp build/$${t}_$${q}.ref build/$${t}_$${q}.opt; \
 	    echo "OK  $$t LOGQ=$$q ($$(wc -c < build/$${t}_$${q}.ref | tr -d " ") bytes identical)"; \
+	    rm -f build/$${t}_$${q}.ref build/$${t}_$${q}.opt; \
 	  done; \
 	  build/prover_$${q}_ref build/prover_$${q}.ref; \
 	  for n in 1 4; do \
@@ -61,6 +63,7 @@ check: all
 	    cmp build/prover_$${q}.ref build/prover_$${q}.opt$$n; \
 	  done; \
 	  echo "OK  prover LOGQ=$$q ($$(wc -l < build/prover_$${q}.ref | tr -d ' ') proofs identical, LAB_THREADS=1,4)"; \
+	  rm -f build/prover_$${q}.ref build/prover_$${q}.opt1 build/prover_$${q}.opt4; \
 	done; echo "ALL OK"
 
 bench: all
